@@ -34,3 +34,14 @@ Target another thread or read a long objective from a file:
 bb goal start thr_example --objective-file ./objective.md
 bb goal status thr_example --json
 ```
+
+Edit or control the unfinished Goal from the current thread context:
+
+```sh
+bb goal edit "Ship the parser and its recovery cases"
+bb goal pause
+bb goal resume --json
+bb goal cancel
+```
+
+Pass `thr_example` after any subcommand to target that thread explicitly. Mutations use the current Goal revision as a compare-and-swap guard, so a concurrent edit or transition fails instead of overwriting newer state.

@@ -11,6 +11,9 @@ export const goalStates = [
 
 export type GoalState = (typeof goalStates)[number];
 
+export const goalMutationTypes = ["edit", "pause", "resume", "cancel"] as const;
+export type GoalMutationType = (typeof goalMutationTypes)[number];
+
 export const GoalDtoSchema = Schema.Struct({
   id: Schema.String,
   threadId: Schema.String,
@@ -33,6 +36,12 @@ export interface GoalDto {
   readonly finishedAt: string | null;
 }
 
+interface GuardedGoalCommand {
+  readonly threadId: string;
+  readonly goalId: string;
+  readonly expectedRevision: number;
+}
+
 export type GoalCommand =
   | {
       readonly type: "start";
@@ -42,13 +51,51 @@ export type GoalCommand =
   | {
       readonly type: "status";
       readonly threadId: string;
-    };
+    }
+  | (GuardedGoalCommand & {
+      readonly type: "edit";
+      readonly objective: string;
+    })
+  | (GuardedGoalCommand & {
+      readonly type: "pause" | "resume" | "cancel";
+    });
+
+export type GoalMutationCommand = Extract<
+  GoalCommand,
+  { readonly type: GoalMutationType }
+>;
 
 export class GoalAlreadyExists extends Schema.TaggedError<GoalAlreadyExists>()(
   "GoalAlreadyExists",
   {
     threadId: Schema.String,
     goalId: Schema.String,
+  },
+) {}
+
+export class GoalNotFound extends Schema.TaggedError<GoalNotFound>()(
+  "GoalNotFound",
+  {
+    threadId: Schema.String,
+    goalId: Schema.String,
+  },
+) {}
+
+export class GoalStaleGuard extends Schema.TaggedError<GoalStaleGuard>()(
+  "GoalStaleGuard",
+  {
+    goalId: Schema.String,
+    expectedRevision: Schema.Int,
+    actualRevision: Schema.Int,
+  },
+) {}
+
+export class GoalInvalidTransition extends Schema.TaggedError<GoalInvalidTransition>()(
+  "GoalInvalidTransition",
+  {
+    goalId: Schema.String,
+    action: Schema.Literals(goalMutationTypes),
+    state: Schema.Literals(goalStates),
   },
 ) {}
 
@@ -74,6 +121,9 @@ export class GoalGatewayError extends Schema.TaggedError<GoalGatewayError>()(
 
 export type GoalError =
   | GoalAlreadyExists
+  | GoalNotFound
+  | GoalStaleGuard
+  | GoalInvalidTransition
   | GoalThreadNotFound
   | GoalInvalidObjective
   | GoalPersistenceError
@@ -81,6 +131,9 @@ export type GoalError =
 
 export type GoalErrorCode =
   | "goal_already_exists"
+  | "goal_not_found"
+  | "stale_goal"
+  | "invalid_transition"
   | "thread_not_found"
   | "invalid_objective"
   | "persistence_error"
@@ -101,6 +154,21 @@ export function goalErrorToDto(error: GoalError): GoalErrorDto {
       return {
         code: "goal_already_exists",
         message: `Thread ${error.threadId} already has unfinished Goal ${error.goalId}.`,
+      };
+    case "GoalNotFound":
+      return {
+        code: "goal_not_found",
+        message: `Goal ${error.goalId} was not found on thread ${error.threadId}.`,
+      };
+    case "GoalStaleGuard":
+      return {
+        code: "stale_goal",
+        message: `Goal ${error.goalId} changed from revision ${error.expectedRevision} to ${error.actualRevision}. Refresh and retry.`,
+      };
+    case "GoalInvalidTransition":
+      return {
+        code: "invalid_transition",
+        message: `Cannot ${error.action} Goal ${error.goalId} while it is ${error.state}.`,
       };
     case "GoalThreadNotFound":
       return {

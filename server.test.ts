@@ -4,6 +4,7 @@ import {
   makeThreadResponse,
 } from "@get-bb/plugin-sdk/testing";
 import plugin, { createPlugin } from "./server";
+import type { GoalDto } from "./src/domain";
 import { makeGoalRuntime, type GoalRuntime } from "./src/runtime";
 
 function fakeHost() {
@@ -43,12 +44,20 @@ describe("Goal BB adapter", () => {
       expect(harness.inspection.registrations.rpcMethods).toEqual([
         "start",
         "status",
+        "edit",
+        "pause",
+        "resume",
+        "cancel",
       ]);
       expect(harness.inspection.registrations.cli).toMatchObject({
         name: "goal",
         commands: [
           { name: "start" },
           { name: "status" },
+          { name: "edit" },
+          { name: "pause" },
+          { name: "resume" },
+          { name: "cancel" },
         ],
       });
     } finally {
@@ -86,6 +95,68 @@ describe("Goal BB adapter", () => {
     }
   });
 
+  it("provides guarded RPC lifecycle routes and publishes each mutation", async () => {
+    const { bb, harness } = fakeHost();
+    await plugin(bb);
+    try {
+      const started = (await harness.behavior.callRpc("start", {
+        threadId: "thr_rpc_control",
+        objective: "initial objective",
+      })) as { goal: GoalDto };
+      const edited = (await harness.behavior.callRpc("edit", {
+        threadId: "thr_rpc_control",
+        goalId: started.goal.id,
+        expectedRevision: 1,
+        objective: "redirected objective",
+      })) as { goal: GoalDto };
+      expect(edited.goal).toMatchObject({
+        id: started.goal.id,
+        objective: "redirected objective",
+        revision: 2,
+      });
+
+      await expect(
+        harness.behavior.callRpc("pause", {
+          threadId: "thr_rpc_control",
+          goalId: started.goal.id,
+          expectedRevision: 1,
+        }),
+      ).rejects.toThrow("[stale_goal]");
+      expect(harness.inspection.realtimeSignals).toHaveLength(2);
+
+      const paused = (await harness.behavior.callRpc("pause", {
+        threadId: "thr_rpc_control",
+        goalId: started.goal.id,
+        expectedRevision: 2,
+      })) as { goal: GoalDto };
+      expect(paused.goal).toMatchObject({ state: "paused", revision: 3 });
+
+      const resumed = (await harness.behavior.callRpc("resume", {
+        threadId: "thr_rpc_control",
+        goalId: started.goal.id,
+        expectedRevision: 3,
+      })) as { goal: GoalDto };
+      expect(resumed.goal).toMatchObject({ state: "active", revision: 4 });
+
+      const canceled = (await harness.behavior.callRpc("cancel", {
+        threadId: "thr_rpc_control",
+        goalId: started.goal.id,
+        expectedRevision: 4,
+      })) as { goal: GoalDto };
+      expect(canceled.goal).toMatchObject({
+        state: "canceled",
+        revision: 5,
+      });
+      expect(canceled.goal.finishedAt).not.toBeNull();
+      expect(harness.inspection.realtimeSignals).toHaveLength(5);
+      await expect(
+        harness.behavior.callRpc("status", { threadId: "thr_rpc_control" }),
+      ).resolves.toEqual({ goal: null });
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
   it("resolves current-thread and explicit-thread CLI targets", async () => {
     const { bb, harness } = fakeHost();
     await plugin(bb);
@@ -120,6 +191,71 @@ describe("Goal BB adapter", () => {
       expect(JSON.parse(explicitStatus.stdout)).toMatchObject({
         goal: { threadId: "thr_explicit", state: "active" },
       });
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
+  it("controls a Goal through human and JSON CLI routes", async () => {
+    const { bb, harness } = fakeHost();
+    await plugin(bb);
+    try {
+      await harness.behavior.runCli(["start", "CLI lifecycle"], {
+        threadId: "thr_cli_control",
+      });
+
+      const edited = await harness.behavior.runCli(
+        ["edit", "Redirected from CLI"],
+        { threadId: "thr_cli_control" },
+      );
+      expect(edited).toMatchObject({ exitCode: 0 });
+      expect(edited.stdout).toContain("Edited Goal");
+      expect(edited.stdout).toContain("Revision: 2");
+      expect(edited.stdout).toContain("Objective: Redirected from CLI");
+
+      const paused = await harness.behavior.runCli(["pause", "--json"], {
+        threadId: "thr_cli_control",
+      });
+      expect(JSON.parse(paused.stdout)).toMatchObject({
+        goal: { state: "paused", revision: 3 },
+      });
+
+      const repeatedPause = await harness.behavior.runCli(
+        ["pause", "--json"],
+        { threadId: "thr_cli_control" },
+      );
+      expect(repeatedPause.exitCode).toBe(4);
+      expect(JSON.parse(repeatedPause.stderr)).toMatchObject({
+        ok: false,
+        error: { code: "invalid_transition" },
+      });
+
+      const resumed = await harness.behavior.runCli(["resume"], {
+        threadId: "thr_cli_control",
+      });
+      expect(resumed.stdout).toContain("Resumed Goal");
+      expect(resumed.stdout).toContain("State: active");
+
+      const canceled = await harness.behavior.runCli(["cancel", "--json"], {
+        threadId: "thr_cli_control",
+      });
+      expect(JSON.parse(canceled.stdout)).toMatchObject({
+        goal: { state: "canceled", revision: 5 },
+      });
+
+      const repeatedCancel = await harness.behavior.runCli(
+        ["cancel", "--json"],
+        { threadId: "thr_cli_control" },
+      );
+      expect(repeatedCancel.exitCode).toBe(3);
+      expect(JSON.parse(repeatedCancel.stderr)).toEqual({
+        ok: false,
+        error: {
+          code: "goal_not_found",
+          message: "No unfinished Goal for thread thr_cli_control.",
+        },
+      });
+      expect(harness.inspection.realtimeSignals).toHaveLength(5);
     } finally {
       await harness.lifecycle.dispose();
     }

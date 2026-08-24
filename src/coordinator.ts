@@ -102,21 +102,42 @@ export class GoalCoordinator extends Context.Service<
             return yield* repository.current(command.threadId);
           }
 
-          const objective = command.objective.trim();
-          if (objective.length === 0) {
+          if (command.type === "start") {
+            const objective = command.objective.trim();
+            if (objective.length === 0) {
+              return yield* new GoalInvalidObjective({
+                message: "A Goal objective cannot be empty.",
+              });
+            }
+
+            const id = yield* ids.next;
+            const now = yield* clock.nowIso;
+            return yield* repository.start({
+              id,
+              threadId: command.threadId,
+              objective,
+              now,
+            });
+          }
+
+          const guardedCommand =
+            command.type === "edit"
+              ? {
+                  ...command,
+                  objective: command.objective.trim(),
+                }
+              : command;
+          if (
+            guardedCommand.type === "edit" &&
+            guardedCommand.objective.length === 0
+          ) {
             return yield* new GoalInvalidObjective({
               message: "A Goal objective cannot be empty.",
             });
           }
 
-          const id = yield* ids.next;
           const now = yield* clock.nowIso;
-          return yield* repository.start({
-            id,
-            threadId: command.threadId,
-            objective,
-            now,
-          });
+          return yield* repository.mutate({ command: guardedCommand, now });
         },
       );
 

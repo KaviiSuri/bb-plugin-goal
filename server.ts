@@ -7,7 +7,12 @@ import {
   type PluginCliResult,
 } from "@get-bb/plugin-sdk";
 import { z } from "zod";
-import { goalStates, type GoalCommandResult, type GoalDto } from "./src/domain";
+import {
+  goalStates,
+  type GoalCommandResult,
+  type GoalDto,
+  type GoalMutationType,
+} from "./src/domain";
 import { GOAL_MIGRATIONS } from "./src/repository";
 import { makeGoalRuntime, type GoalRuntime } from "./src/runtime";
 
@@ -26,6 +31,12 @@ const goalSchema = z
   })
   .strict();
 
+const goalGuardSchema = {
+  threadId: z.string().min(1),
+  goalId: z.string().min(1),
+  expectedRevision: z.number().int().positive(),
+};
+
 export const rpcContract = defineRpcContract({
   start: {
     input: z
@@ -36,6 +47,24 @@ export const rpcContract = defineRpcContract({
   status: {
     input: z.object({ threadId: z.string().min(1) }).strict(),
     output: z.object({ goal: goalSchema.nullable() }).strict(),
+  },
+  edit: {
+    input: z
+      .object({ ...goalGuardSchema, objective: z.string().min(1) })
+      .strict(),
+    output: z.object({ goal: goalSchema }).strict(),
+  },
+  pause: {
+    input: z.object(goalGuardSchema).strict(),
+    output: z.object({ goal: goalSchema }).strict(),
+  },
+  resume: {
+    input: z.object(goalGuardSchema).strict(),
+    output: z.object({ goal: goalSchema }).strict(),
+  },
+  cancel: {
+    input: z.object(goalGuardSchema).strict(),
+    output: z.object({ goal: goalSchema }).strict(),
   },
 });
 
@@ -78,8 +107,11 @@ function resultExitCode(result: GoalCommandResult): number {
     case "invalid_objective":
       return 2;
     case "thread_not_found":
+    case "goal_not_found":
       return 3;
     case "goal_already_exists":
+    case "stale_goal":
+    case "invalid_transition":
       return 4;
     case "persistence_error":
     case "gateway_error":
@@ -97,7 +129,9 @@ function commandResult(
   if (!result.ok) {
     return {
       exitCode,
-      stderr: jsonLine({ ok: false, error: result.error }),
+      stderr: json
+        ? jsonLine({ ok: false, error: result.error })
+        : `${result.error.message}\n`,
     };
   }
   if (json) return { exitCode: 0, stdout: jsonLine({ goal: result.goal }) };
@@ -158,7 +192,10 @@ function parseOptions(argv: string[], allowObjectiveFile: boolean): ParsedOption
   return { json, objectiveFile, positional };
 }
 
-function resolveThreadId(explicit: string | undefined, ctx: PluginCliContext): string {
+function resolveThreadId(
+  explicit: string | undefined,
+  ctx: PluginCliContext,
+): string {
   const threadId = explicit ?? ctx.threadId;
   if (threadId === undefined) {
     throw new CliUsageError(
@@ -210,6 +247,15 @@ async function readObjectiveFile(
     : file.content;
 }
 
+function publishGoalChanged(bb: BbPluginApi, goal: GoalDto): void {
+  bb.realtime.publish(GOAL_REALTIME_CHANNEL, {
+    threadId: goal.threadId,
+    goalId: goal.id,
+    revision: goal.revision,
+    state: goal.state,
+  });
+}
+
 async function runStart(
   bb: BbPluginApi,
   runtime: GoalRuntime,
@@ -238,12 +284,7 @@ async function runStart(
       ? objectiveWords.join(" ")
       : await readObjectiveFile(bb, options.objectiveFile, ctx);
   const result = await runtime.run({ type: "start", threadId, objective });
-  if (result.ok && result.goal !== null) {
-    bb.realtime.publish(GOAL_REALTIME_CHANNEL, {
-      threadId,
-      goalId: result.goal.id,
-    });
-  }
+  if (result.ok && result.goal !== null) publishGoalChanged(bb, result.goal);
   return commandResult(
     result,
     options.json,
@@ -271,6 +312,69 @@ async function runStatus(
   );
 }
 
+function missingCurrentGoal(threadId: string): GoalCommandResult {
+  return {
+    ok: false,
+    error: {
+      code: "goal_not_found",
+      message: `No unfinished Goal for thread ${threadId}.`,
+    },
+  };
+}
+
+async function runMutation(
+  bb: BbPluginApi,
+  runtime: GoalRuntime,
+  type: GoalMutationType,
+  argv: string[],
+  ctx: PluginCliContext,
+): Promise<PluginCliResult> {
+  const options = parseOptions(argv, false);
+  const firstIsThread = options.positional[0]?.startsWith("thr_") ?? false;
+  const explicitThread = firstIsThread ? options.positional[0] : undefined;
+  const remaining = options.positional.slice(firstIsThread ? 1 : 0);
+
+  if (type === "edit") {
+    if (remaining.length === 0) {
+      throw new CliUsageError(
+        "Usage: bb goal edit [thread-id] <objective> [--json]",
+      );
+    }
+  } else if (remaining.length > 0) {
+    throw new CliUsageError(`Usage: bb goal ${type} [thread-id] [--json]`);
+  }
+
+  const threadId = resolveThreadId(explicitThread, ctx);
+  const status = await runtime.run({ type: "status", threadId });
+  if (!status.ok) return commandResult(status, options.json, "", "");
+  if (status.goal === null) {
+    return commandResult(missingCurrentGoal(threadId), options.json, "", "");
+  }
+
+  const guard = {
+    threadId,
+    goalId: status.goal.id,
+    expectedRevision: status.goal.revision,
+  };
+  const result =
+    type === "edit"
+      ? await runtime.run({
+          type,
+          ...guard,
+          objective: remaining.join(" "),
+        })
+      : await runtime.run({ type, ...guard });
+  if (result.ok && result.goal !== null) publishGoalChanged(bb, result.goal);
+
+  const headings: Record<GoalMutationType, string> = {
+    edit: "Edited Goal",
+    pause: "Paused Goal",
+    resume: "Resumed Goal",
+    cancel: "Canceled Goal",
+  };
+  return commandResult(result, options.json, headings[type], "");
+}
+
 async function runCli(
   bb: BbPluginApi,
   runtime: GoalRuntime,
@@ -282,8 +386,16 @@ async function runCli(
     const [command, ...rest] = argv;
     if (command === "start") return await runStart(bb, runtime, rest, ctx);
     if (command === "status") return await runStatus(runtime, rest, ctx);
+    if (
+      command === "edit" ||
+      command === "pause" ||
+      command === "resume" ||
+      command === "cancel"
+    ) {
+      return await runMutation(bb, runtime, command, rest, ctx);
+    }
     throw new CliUsageError(
-      "Usage: bb goal <start|status> ... Run bb goal start or bb goal status.",
+      "Usage: bb goal <start|status|edit|pause|resume|cancel> ...",
     );
   } catch (cause) {
     const message = cause instanceof Error ? cause.message : String(cause);
@@ -323,6 +435,28 @@ export function createPlugin(
       },
     });
 
+    async function mutate(
+      command:
+        | {
+            readonly type: "edit";
+            readonly threadId: string;
+            readonly goalId: string;
+            readonly expectedRevision: number;
+            readonly objective: string;
+          }
+        | {
+            readonly type: "pause" | "resume" | "cancel";
+            readonly threadId: string;
+            readonly goalId: string;
+            readonly expectedRevision: number;
+          },
+    ): Promise<{ goal: GoalDto }> {
+      const goal = requireSuccessful(await runtime.run(command));
+      if (goal === null) throw new Error(`Goal ${command.type} returned no Goal.`);
+      publishGoalChanged(bb, goal);
+      return { goal };
+    }
+
     bb.rpc.register(rpcContract, {
       async start(input) {
         const goal = requireSuccessful(
@@ -333,10 +467,7 @@ export function createPlugin(
           }),
         );
         if (goal === null) throw new Error("Goal start returned no Goal.");
-        bb.realtime.publish(GOAL_REALTIME_CHANNEL, {
-          threadId: input.threadId,
-          goalId: goal.id,
-        });
+        publishGoalChanged(bb, goal);
         return { goal };
       },
       async status(input) {
@@ -345,11 +476,15 @@ export function createPlugin(
         );
         return { goal };
       },
+      edit: (input) => mutate({ type: "edit", ...input }),
+      pause: (input) => mutate({ type: "pause", ...input }),
+      resume: (input) => mutate({ type: "resume", ...input }),
+      cancel: (input) => mutate({ type: "cancel", ...input }),
     });
 
     bb.cli.register({
       name: "goal",
-      summary: "Start and inspect durable thread Goals",
+      summary: "Start, inspect, and control durable thread Goals",
       commands: [
         {
           name: "start",
@@ -361,6 +496,26 @@ export function createPlugin(
           name: "status",
           summary: "Inspect the unfinished Goal for a thread",
           usage: "bb goal status [thread-id] [--json]",
+        },
+        {
+          name: "edit",
+          summary: "Edit the unfinished Goal objective",
+          usage: "bb goal edit [thread-id] <objective> [--json]",
+        },
+        {
+          name: "pause",
+          summary: "Pause an active Goal",
+          usage: "bb goal pause [thread-id] [--json]",
+        },
+        {
+          name: "resume",
+          summary: "Resume a paused Goal",
+          usage: "bb goal resume [thread-id] [--json]",
+        },
+        {
+          name: "cancel",
+          summary: "Cancel an unfinished Goal",
+          usage: "bb goal cancel [thread-id] [--json]",
         },
       ],
       run: (argv, ctx) => runCli(bb, runtime, argv, ctx),
