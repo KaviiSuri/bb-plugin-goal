@@ -82,6 +82,35 @@ describe("Goal coordinator", () => {
     }
   });
 
+  it("database rejects a second unfinished Goal for one thread", async () => {
+    const fixture = makeFixture();
+    try {
+      const insert = fixture.database.prepare(
+        `INSERT INTO goals (
+          id, thread_id, objective, state, revision,
+          created_at, updated_at, finished_at
+        ) VALUES (?, 'thr_one', ?, 'active', 1, ?, ?, NULL)`,
+      );
+      const createdAt = "2026-08-22T12:00:00.000Z";
+
+      insert.run("goal_database_1", "first objective", createdAt, createdAt);
+
+      expect(() =>
+        insert.run(
+          "goal_database_2",
+          "competing objective",
+          createdAt,
+          createdAt,
+        ),
+      ).toThrow(/UNIQUE constraint failed: goals\.thread_id/);
+      expect(
+        fixture.database.prepare("SELECT COUNT(*) AS count FROM goals").get(),
+      ).toEqual({ count: 1 });
+    } finally {
+      await fixture.close();
+    }
+  });
+
   it("restores the current Goal after coordinator reconstruction", async () => {
     const fixture = makeFixture();
     try {
