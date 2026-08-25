@@ -1196,13 +1196,25 @@ export function createPlugin(
 
     const CONTINUATION_RETRY_BASE_MS = 25;
     const CONTINUATION_RETRY_MAX_MS = 1_000;
+    const OWNERSHIP_RETRY_BASE_MS = 25;
+    const OWNERSHIP_RETRY_MAX_MS = 1_000;
     let disposed = false;
+    const lifecycleAbortController = new AbortController();
     let wakeWorker: (() => void) | null = null;
     let wakePending = false;
     const pendingIdleEvents = new Map<
       string,
       { readonly threadId: string; readonly opportunityKey: string }
     >();
+    const pendingOwnershipReconciliations = new Map<
+      string,
+      {
+        readonly threadId: string;
+        readonly attempt: number;
+        readonly nextAttemptAt: number;
+      }
+    >();
+    const ownershipReconciliationsInFlight = new Set<string>();
     const pendingIdleEventKey = (threadId: string, opportunityKey: string) =>
       `${threadId}\u0000${opportunityKey}`;
     const clearPendingIdleEvents = (threadId: string) => {
@@ -1252,34 +1264,119 @@ export function createPlugin(
       }
     };
 
-    const reconcileThreadOwnership = async () => {
-      for (const threadId of await runtime.ownedThreadIds()) {
-        let thread;
-        try {
-          thread = await bb.sdk.threads.get({ threadId });
-        } catch (cause) {
-          if (!isThreadMissingError(cause)) throw cause;
-          clearPendingIdleEvents(threadId);
-          await runtime.deleteThread(threadId);
-          publishThreadInvalidation(bb, threadId, "deleted");
-          continue;
-        }
-        if (thread.deletedAt !== null) {
-          clearPendingIdleEvents(threadId);
-          await runtime.deleteThread(threadId);
-          publishThreadInvalidation(bb, threadId, "deleted");
-          continue;
-        }
-        if (thread.archivedAt !== null) {
-          clearPendingIdleEvents(threadId);
-          const goal = await runtime.archiveThread(threadId);
-          if (goal === null) {
-            publishThreadInvalidation(bb, threadId, "archived");
-          } else {
-            publishGoalChanged(bb, goal);
-          }
+    const queueOwnershipReconciliation = (threadId: string) => {
+      const existing = pendingOwnershipReconciliations.get(threadId);
+      const now = Date.now();
+      pendingOwnershipReconciliations.set(threadId, {
+        threadId,
+        attempt: existing?.attempt ?? 0,
+        nextAttemptAt: Math.min(existing?.nextAttemptAt ?? now, now),
+      });
+      wake();
+    };
+
+    const reconcileOneThreadOwnership = async (
+      threadId: string,
+      signal: AbortSignal,
+    ) => {
+      let thread;
+      try {
+        thread = await bb.sdk.threads.get({ threadId, signal });
+      } catch (cause) {
+        if (!isThreadMissingError(cause)) throw cause;
+        if (signal.aborted || disposed) return;
+        clearPendingIdleEvents(threadId);
+        await runtime.deleteThread(threadId);
+        if (signal.aborted || disposed) return;
+        publishThreadInvalidation(bb, threadId, "deleted");
+        return;
+      }
+      if (signal.aborted || disposed) return;
+      if (thread.deletedAt !== null) {
+        clearPendingIdleEvents(threadId);
+        await runtime.deleteThread(threadId);
+        if (signal.aborted || disposed) return;
+        publishThreadInvalidation(bb, threadId, "deleted");
+        return;
+      }
+      if (thread.archivedAt !== null) {
+        clearPendingIdleEvents(threadId);
+        const goal = await runtime.archiveThread(threadId);
+        if (signal.aborted || disposed) return;
+        if (goal === null) {
+          publishThreadInvalidation(bb, threadId, "archived");
+        } else {
+          publishGoalChanged(bb, goal);
         }
       }
+    };
+
+    const retryOneOwnershipReconciliation = async (
+      threadId: string,
+      signal: AbortSignal,
+    ) => {
+      const pending = pendingOwnershipReconciliations.get(threadId);
+      if (
+        pending === undefined ||
+        pending.nextAttemptAt > Date.now() ||
+        ownershipReconciliationsInFlight.has(threadId) ||
+        signal.aborted ||
+        disposed
+      ) {
+        return;
+      }
+      ownershipReconciliationsInFlight.add(threadId);
+      try {
+        await reconcileOneThreadOwnership(threadId, signal);
+        if (
+          !signal.aborted &&
+          !disposed &&
+          pendingOwnershipReconciliations.get(threadId) === pending
+        ) {
+          pendingOwnershipReconciliations.delete(threadId);
+        }
+      } catch (cause) {
+        if (signal.aborted || disposed) return;
+        const attempt = pending.attempt + 1;
+        const delayMs = Math.min(
+          OWNERSHIP_RETRY_BASE_MS * 2 ** Math.min(attempt - 1, 20),
+          OWNERSHIP_RETRY_MAX_MS,
+        );
+        pendingOwnershipReconciliations.set(threadId, {
+          threadId,
+          attempt,
+          nextAttemptAt: Date.now() + delayMs,
+        });
+        bb.log.error(
+          `Could not reconcile Goal ownership for thread ${threadId}; retry ${attempt} in ${delayMs}ms: ${cause instanceof Error ? cause.message : String(cause)}`,
+        );
+      } finally {
+        ownershipReconciliationsInFlight.delete(threadId);
+        if (pendingOwnershipReconciliations.has(threadId)) wake();
+      }
+    };
+
+    const retryPendingOwnershipReconciliations = async (
+      signal: AbortSignal,
+    ) => {
+      for (const { threadId } of pendingOwnershipReconciliations.values()) {
+        if (signal.aborted || disposed) return;
+        await retryOneOwnershipReconciliation(threadId, signal);
+      }
+    };
+
+    const nextOwnershipRetryWaitMs = (): number | null => {
+      let nextAttemptAt: number | null = null;
+      for (const pending of pendingOwnershipReconciliations.values()) {
+        if (ownershipReconciliationsInFlight.has(pending.threadId)) continue;
+        nextAttemptAt =
+          nextAttemptAt === null
+            ? pending.nextAttemptAt
+            : Math.min(nextAttemptAt, pending.nextAttemptAt);
+      }
+      return nextAttemptAt === null
+        ? null
+        : Math.max(0, nextAttemptAt - Date.now());
     };
 
     bb.events.on("thread.idle", async ({ thread }) => {
@@ -1314,62 +1411,20 @@ export function createPlugin(
 
     bb.events.on("thread.archived", async ({ thread: observedThread }) => {
       if (disposed) return;
-      try {
-        const thread = await bb.sdk.threads.get({ threadId: observedThread.id });
-        if (thread.deletedAt !== null) {
-          clearPendingIdleEvents(thread.id);
-          await runtime.deleteThread(thread.id);
-          publishThreadInvalidation(bb, thread.id, "deleted");
-          wake();
-          return;
-        }
-        if (thread.archivedAt === null) return;
-        clearPendingIdleEvents(thread.id);
-        const goal = await runtime.archiveThread(thread.id);
-        if (goal === null) {
-          publishThreadInvalidation(bb, thread.id, "archived");
-        } else {
-          publishGoalChanged(bb, goal);
-        }
-        wake();
-      } catch (cause) {
-        if (isThreadMissingError(cause)) {
-          try {
-            clearPendingIdleEvents(observedThread.id);
-            await runtime.deleteThread(observedThread.id);
-            publishThreadInvalidation(bb, observedThread.id, "deleted");
-            wake();
-          } catch (cleanupCause) {
-            if (!disposed) {
-              bb.log.error(
-                `Could not delete Goal state after archive reconciliation: ${cleanupCause instanceof Error ? cleanupCause.message : String(cleanupCause)}`,
-              );
-            }
-          }
-          return;
-        }
-        if (!disposed) {
-          bb.log.error(
-            `Could not archive Goal state: ${cause instanceof Error ? cause.message : String(cause)}`,
-          );
-        }
-      }
+      queueOwnershipReconciliation(observedThread.id);
+      await retryOneOwnershipReconciliation(
+        observedThread.id,
+        lifecycleAbortController.signal,
+      );
     });
 
     bb.events.on("thread.deleted", async ({ thread }) => {
       if (disposed) return;
-      try {
-        clearPendingIdleEvents(thread.id);
-        await runtime.deleteThread(thread.id);
-        publishThreadInvalidation(bb, thread.id, "deleted");
-        wake();
-      } catch (cause) {
-        if (!disposed) {
-          bb.log.error(
-            `Could not delete Goal state: ${cause instanceof Error ? cause.message : String(cause)}`,
-          );
-        }
-      }
+      queueOwnershipReconciliation(thread.id);
+      await retryOneOwnershipReconciliation(
+        thread.id,
+        lifecycleAbortController.signal,
+      );
     });
 
     bb.events.on("thread.failed", async ({ thread, error }) => {
@@ -1404,12 +1459,15 @@ export function createPlugin(
       async start(signal) {
         let retryDelayMs = CONTINUATION_RETRY_BASE_MS;
         let ownershipReconciled = false;
-        while (!signal.aborted) {
+        while (!signal.aborted && !disposed) {
           try {
             if (!ownershipReconciled) {
-              await reconcileThreadOwnership();
+              for (const threadId of await runtime.ownedThreadIds()) {
+                queueOwnershipReconciliation(threadId);
+              }
               ownershipReconciled = true;
             }
+            await retryPendingOwnershipReconciliations(signal);
             await retryPendingIdleEvents(signal);
             const recoveredGoals = await runtime.recoverUsageLimits();
             for (const goal of recoveredGoals) {
@@ -1426,13 +1484,21 @@ export function createPlugin(
               claimed = await runtime.processContinuation(signal);
             } while (claimed && !signal.aborted);
             retryDelayMs = CONTINUATION_RETRY_BASE_MS;
-            if (!signal.aborted) {
+            if (!signal.aborted && !disposed) {
               const nextReset = await runtime.nextUsageLimitReset();
               const parsedReset = nextReset === null ? Number.NaN : Date.parse(nextReset);
-              const waitMs = Number.isFinite(parsedReset)
+              const usageWaitMs = Number.isFinite(parsedReset)
                 ? Math.max(0, parsedReset - Date.now())
                 : null;
+              const ownershipWaitMs = nextOwnershipRetryWaitMs();
+              const waitMs =
+                usageWaitMs === null
+                  ? ownershipWaitMs
+                  : ownershipWaitMs === null
+                    ? usageWaitMs
+                    : Math.min(usageWaitMs, ownershipWaitMs);
               if (pendingIdleEvents.size > 0) continue;
+              if (ownershipWaitMs === 0) continue;
               await waitForWork(signal, waitMs);
             }
           } catch (cause) {
@@ -1675,6 +1741,7 @@ export function createPlugin(
 
     bb.onDispose(() => {
       disposed = true;
+      lifecycleAbortController.abort();
       wake();
       return runtime.dispose();
     });

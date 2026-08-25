@@ -217,13 +217,30 @@ describe("Goal BB adapter", () => {
   });
 
   it("deletes thread-owned state and publishes a tombstone with no Goal DTO", async () => {
-    const { bb, harness } = fakeHost();
+    let deletedAt: number | null = null;
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "goal",
+      sdk: {
+        threads: {
+          get: async ({ threadId }) =>
+            makeThreadResponse({
+              id: threadId,
+              deletedAt,
+              environmentId: "env_test",
+            }),
+          queuedMessages: { list: async () => [] },
+          interactions: { list: async () => [] },
+          timeline: async () => ({ rows: [], activePromptMode: null }),
+        },
+      },
+    });
     await deterministicPlugin()(bb);
     try {
       await harness.behavior.callRpc("start", {
         threadId: "thr_deleted",
         objective: "remove with thread",
       });
+      deletedAt = 200;
       const deletedThread = makeThreadResponse({
         id: "thr_deleted",
         deletedAt: 200,
@@ -363,15 +380,25 @@ describe("Goal BB adapter", () => {
     }
   });
 
-  it("contains lifecycle handler failures instead of detaching work", async () => {
-    let archivedAt: number | null = 100;
-    const failingPlugin = createPlugin({
+  it("retries one failed archive reconciliation without a second lifecycle event", async () => {
+    let archivedAt: number | null = null;
+    let archiveCalls = 0;
+    let ownershipScans = 0;
+    const retryingPlugin = createPlugin({
       makeRuntime(database, gateway) {
         const runtime = makeGoalRuntime(database, gateway);
         return {
           ...runtime,
-          archiveThread: async () => {
-            throw new Error("archive transaction failed");
+          archiveThread: async (threadId) => {
+            archiveCalls += 1;
+            if (archiveCalls === 1) {
+              throw new Error("archive transaction failed once");
+            }
+            return runtime.archiveThread(threadId);
+          },
+          ownedThreadIds: async () => {
+            ownershipScans += 1;
+            return runtime.ownedThreadIds();
           },
         };
       },
@@ -381,22 +408,177 @@ describe("Goal BB adapter", () => {
       sdk: {
         threads: {
           get: async ({ threadId }) => makeThreadResponse({ id: threadId, archivedAt }),
+          queuedMessages: { list: async () => [] },
+          interactions: { list: async () => [] },
+          timeline: async () => ({ rows: [], activePromptMode: null }),
         },
       },
     });
-    await failingPlugin(bb);
+    await retryingPlugin(bb);
+    const service = harness.behavior.runService("continuations");
     try {
+      await waitUntil(() => ownershipScans === 1);
+      await harness.behavior.callRpc("start", {
+        threadId: "thr_archive_retry",
+        objective: "pause after retry",
+      });
+      archivedAt = 100;
       const result = await harness.behavior.emitThreadEvent("thread.archived", {
-        thread: makeThreadResponse({ id: "thr_error", archivedAt }),
+        thread: makeThreadResponse({ id: "thr_archive_retry", archivedAt }),
       });
       expect(result.errors).toEqual([]);
-      expect(harness.inspection.logEntries.at(-1)).toMatchObject({
-        level: "error",
-        message: expect.stringContaining("archive transaction failed"),
+      const database = bb.storage.database();
+      await waitUntil(
+        () =>
+          (database
+            .prepare("SELECT state FROM goals WHERE thread_id = ?")
+            .get("thr_archive_retry") as { readonly state: string } | undefined)
+            ?.state === "paused",
+      );
+      expect(archiveCalls).toBe(2);
+      expect(
+        harness.inspection.logEntries.some((entry) =>
+          entry.message.includes("archive transaction failed once"),
+        ),
+      ).toBe(true);
+    } finally {
+      service.controller.abort();
+      await service.done;
+      await harness.lifecycle.dispose();
+    }
+  });
+
+  it("retries one failed delete reconciliation without a second lifecycle event", async () => {
+    let deletedAt: number | null = null;
+    let deleteCalls = 0;
+    let ownershipScans = 0;
+    const retryingPlugin = createPlugin({
+      makeRuntime(database, gateway) {
+        const runtime = makeGoalRuntime(database, gateway);
+        return {
+          ...runtime,
+          deleteThread: async (threadId) => {
+            deleteCalls += 1;
+            if (deleteCalls === 1) {
+              throw new Error("delete transaction failed once");
+            }
+            return runtime.deleteThread(threadId);
+          },
+          ownedThreadIds: async () => {
+            ownershipScans += 1;
+            return runtime.ownedThreadIds();
+          },
+        };
+      },
+    });
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "goal",
+      sdk: {
+        threads: {
+          get: async ({ threadId }) =>
+            makeThreadResponse({ id: threadId, deletedAt }),
+          queuedMessages: { list: async () => [] },
+          interactions: { list: async () => [] },
+          timeline: async () => ({ rows: [], activePromptMode: null }),
+        },
+      },
+    });
+    await retryingPlugin(bb);
+    const service = harness.behavior.runService("continuations");
+    try {
+      await waitUntil(() => ownershipScans === 1);
+      await harness.behavior.callRpc("start", {
+        threadId: "thr_delete_retry",
+        objective: "delete after retry",
+      });
+      deletedAt = 100;
+      const result = await harness.behavior.emitThreadEvent("thread.deleted", {
+        thread: makeThreadResponse({ id: "thr_delete_retry", deletedAt }),
+      });
+      expect(result.errors).toEqual([]);
+      const database = bb.storage.database();
+      await waitUntil(
+        () =>
+          (database
+            .prepare("SELECT COUNT(*) AS count FROM goals WHERE thread_id = ?")
+            .get("thr_delete_retry") as { readonly count: number }).count === 0,
+      );
+      expect(deleteCalls).toBe(2);
+      expect(harness.inspection.realtimeSignals.at(-1)).toMatchObject({
+        channel: GOAL_REALTIME_CHANNEL,
+        payload: {
+          threadId: "thr_delete_retry",
+          deleted: true,
+          lifecycle: "deleted",
+        },
       });
     } finally {
-      archivedAt = null;
+      service.controller.abort();
+      await service.done;
       await harness.lifecycle.dispose();
+    }
+  });
+
+  it("cancels pending ownership reconciliation retries on disposal", async () => {
+    let archivedAt: number | null = null;
+    let archiveCalls = 0;
+    let ownershipScans = 0;
+    let allowArchive = false;
+    const retryingPlugin = createPlugin({
+      makeRuntime(database, gateway) {
+        const runtime = makeGoalRuntime(database, gateway);
+        return {
+          ...runtime,
+          archiveThread: async (threadId) => {
+            archiveCalls += 1;
+            if (!allowArchive) throw new Error("archive retry pending");
+            return runtime.archiveThread(threadId);
+          },
+          ownedThreadIds: async () => {
+            ownershipScans += 1;
+            return runtime.ownedThreadIds();
+          },
+        };
+      },
+    });
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "goal",
+      sdk: {
+        threads: {
+          get: async ({ threadId }) =>
+            makeThreadResponse({ id: threadId, archivedAt }),
+          queuedMessages: { list: async () => [] },
+          interactions: { list: async () => [] },
+          timeline: async () => ({ rows: [], activePromptMode: null }),
+        },
+      },
+    });
+    await retryingPlugin(bb);
+    const service = harness.behavior.runService("continuations");
+    let disposed = false;
+    try {
+      await waitUntil(() => ownershipScans === 1);
+      await harness.behavior.callRpc("start", {
+        threadId: "thr_dispose_retry",
+        objective: "do not mutate after disposal",
+      });
+      archivedAt = 100;
+      await harness.behavior.emitThreadEvent("thread.archived", {
+        thread: makeThreadResponse({ id: "thr_dispose_retry", archivedAt }),
+      });
+      expect(archiveCalls).toBe(1);
+
+      await harness.lifecycle.dispose();
+      disposed = true;
+      await service.done;
+      const callsAtDisposal = archiveCalls;
+      allowArchive = true;
+      await new Promise((resolve) => setTimeout(resolve, 75));
+      expect(archiveCalls).toBe(callsAtDisposal);
+    } finally {
+      service.controller.abort();
+      await service.done;
+      if (!disposed) await harness.lifecycle.dispose();
     }
   });
 
