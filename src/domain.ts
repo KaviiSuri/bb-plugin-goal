@@ -86,6 +86,12 @@ interface GuardedGoalCommand {
   readonly expectedRevision: number;
 }
 
+export interface GoalFailureEventIdentity {
+  readonly id: string;
+  readonly seq: number;
+  readonly createdAt: number;
+}
+
 export type GoalFailure =
   | {
       readonly kind: "ordinary";
@@ -109,6 +115,8 @@ export type GoalCommand =
       readonly type: "failure";
       readonly threadId: string;
       readonly failure: GoalFailure;
+      readonly event?: GoalFailureEventIdentity;
+      readonly observedEvents?: readonly GoalFailureEventIdentity[];
     }
   | {
       readonly type: "status";

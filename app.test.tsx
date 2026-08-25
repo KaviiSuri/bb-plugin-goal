@@ -237,7 +237,7 @@ describe("Goal composer row", () => {
       expect(await slot.findByText("Waiting for usage reset")).toBeTruthy();
       expect(slot.getByRole("button", { name: "Edit Goal" })).toBeTruthy();
       expect(slot.getByRole("button", { name: "Cancel Goal" })).toBeTruthy();
-      expect(slot.queryByRole("button", { name: "Pause Goal" })).toBeNull();
+      expect(slot.getByRole("button", { name: "Pause Goal" })).toBeTruthy();
       expect(slot.getByRole("button", { name: "Resume Goal" })).toBeTruthy();
     } finally {
       slot.lifecycle.unmount();

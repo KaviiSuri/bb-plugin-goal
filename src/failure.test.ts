@@ -7,6 +7,9 @@ describe("structured Goal failure classification", () => {
       classifyGoalFailure(
         [
           {
+            id: "event-rate-subscription",
+            seq: 2,
+            createdAt: Date.parse("2026-08-22T12:01:00.000Z"),
             type: "provider/rateLimits/updated",
             data: {
               rateLimits: {
@@ -34,11 +37,52 @@ describe("structured Goal failure classification", () => {
     });
   });
 
+  it("classifies the newest failure by sequence instead of stale event kind priority", () => {
+    expect(
+      classifyGoalFailure(
+        [
+          {
+            id: "old-rate-limit",
+            seq: 10,
+            createdAt: Date.parse("2026-08-22T12:00:10.000Z"),
+            type: "provider/rateLimits/updated",
+            data: {
+              rateLimits: {
+                kind: "subscription-window",
+                status: "blocked",
+                reachedReason: "old limit",
+                windows: [],
+              },
+            },
+          },
+          {
+            id: "new-provider-error",
+            seq: 11,
+            createdAt: Date.parse("2026-08-22T12:00:11.000Z"),
+            type: "provider/error",
+            data: {
+              message: "new ordinary failure",
+              errorInfo: { category: "server-error", providerCode: null },
+            },
+          },
+        ],
+        Date.parse("2026-08-22T12:01:00.000Z"),
+      ),
+    ).toMatchObject({
+      kind: "ordinary",
+      source: "provider",
+      reason: expect.stringContaining("new ordinary failure"),
+    });
+  });
+
   it("requires a reset from structured data and leaves credits manual", () => {
     expect(
       classifyGoalFailure(
         [
           {
+            id: "event-rate-credits",
+            seq: 4,
+            createdAt: Date.parse("2026-08-22T12:02:00.000Z"),
             type: "provider/rateLimits/updated",
             data: {
               rateLimits: {
@@ -66,6 +110,9 @@ describe("structured Goal failure classification", () => {
       classifyGoalFailure(
         [
           {
+            id: "event-provider-error",
+            seq: 6,
+            createdAt: Date.parse("2026-08-22T12:03:00.000Z"),
             type: "provider/error",
             data: {
               message: "The provider connection was refused.",

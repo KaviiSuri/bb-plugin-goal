@@ -19,6 +19,7 @@ import { decodeGoalHistoryCursor } from "./history-cursor";
 import {
   GoalRepository,
   type GoalContinuationRecord,
+  type RecoverGoalUsageLimitRecord,
 } from "./repository";
 
 export type GoalThreadStatus =
@@ -326,6 +327,8 @@ export class GoalCoordinator extends Context.Service<
                 threadId: command.threadId,
                 failure: command.failure,
                 now: yield* clock.nowIso,
+                event: command.event,
+                observedEvents: command.observedEvents,
               }),
             };
           }
@@ -547,7 +550,21 @@ export class GoalContinuationCoordinator extends Context.Service<
         "GoalContinuationCoordinator.recoverUsageLimits",
       )(function* () {
         const now = yield* clock.nowIso;
-        return yield* repository.recoverUsageLimits(now);
+        const due = yield* repository.dueUsageLimits(now);
+        const recovered: GoalDto[] = [];
+        for (const goal of due) {
+          const thread = yield* gateway.readThread(goal.threadId);
+          if (!goalContinuationEligibility(thread).eligible) continue;
+          const record: RecoverGoalUsageLimitRecord = {
+            goalId: goal.id,
+            threadId: goal.threadId,
+            expectedRevision: goal.revision,
+            now,
+          };
+          const updated = yield* repository.recoverUsageLimit(record);
+          if (updated !== null) recovered.push(updated);
+        }
+        return recovered;
       });
 
       const nextUsageLimitReset = Effect.fn(

@@ -27,7 +27,10 @@ interface Fixture {
 
 function makeFixture(
   existingThreads: readonly string[] = ["thr_one"],
-  options: { readonly readThread?: () => Promise<GoalThreadSnapshot> } = {},
+  options: {
+    readonly readThread?: () => Promise<GoalThreadSnapshot>;
+    readonly nowIso?: () => string;
+  } = {},
 ): Fixture {
   const directory = mkdtempSync(join(tmpdir(), "bb-goal-"));
   const database = new Database(join(directory, "goal.db"));
@@ -45,7 +48,7 @@ function makeFixture(
     },
     {
       nextGoalId: () => `goal_${++id}`,
-      nowIso: () => "2026-08-22T12:00:00.000Z",
+      nowIso: options.nowIso ?? (() => "2026-08-22T12:00:00.000Z"),
     },
   );
   return {
@@ -591,7 +594,7 @@ describe("Goal coordinator", () => {
     }
   });
 
-  it("allows edit, manual resume, and cancel while waiting", async () => {
+  it("allows manual pause to override a waiting usage reset", async () => {
     const fixture = makeFixture();
     try {
       await fixture.runtime.run({
@@ -615,36 +618,42 @@ describe("Goal coordinator", () => {
         goal: { state: "waiting", revision: 2 },
       });
 
-      const rejected = await fixture.runtime.run({
+      const paused = await fixture.runtime.run({
         type: "pause",
         threadId: "thr_one",
         goalId: "goal_1",
         expectedRevision: 2,
       });
-      expect(rejected).toMatchObject({
-        ok: false,
-        error: { code: "invalid_transition" },
+      expect(paused).toMatchObject({
+        ok: true,
+        goal: {
+          state: "paused",
+          revision: 3,
+          pauseReasonCode: "manual",
+          usageResetAt: null,
+        },
       });
+
       const resumed = await fixture.runtime.run({
         type: "resume",
         threadId: "thr_one",
         goalId: "goal_1",
-        expectedRevision: 2,
+        expectedRevision: 3,
       });
       expect(resumed).toMatchObject({
         ok: true,
-        goal: { state: "active", revision: 3 },
+        goal: { state: "active", revision: 4 },
       });
 
       const canceled = await fixture.runtime.run({
         type: "cancel",
         threadId: "thr_one",
         goalId: "goal_1",
-        expectedRevision: 3,
+        expectedRevision: 4,
       });
       expect(canceled).toMatchObject({
         ok: true,
-        goal: { state: "canceled", revision: 4 },
+        goal: { state: "canceled", revision: 5 },
       });
     } finally {
       await fixture.close();
@@ -1464,6 +1473,135 @@ describe("Goal coordinator", () => {
         fixture.runtime.processContinuation(new AbortController().signal),
       ).resolves.toBe(true);
       expect(fixture.continuationSends()).toBe(1);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("does not reapply a duplicate structured failure after manual resume", async () => {
+    const fixture = makeFixture();
+    const event = {
+      id: "event-duplicate-failure",
+      seq: 12,
+      createdAt: Date.parse("2026-08-22T12:00:01.000Z"),
+    };
+    try {
+      await fixture.runtime.run({
+        type: "start",
+        threadId: "thr_one",
+        objective: "deduplicate provider failures",
+      });
+      await fixture.runtime.recordFailure(
+        "thr_one",
+        {
+          kind: "ordinary",
+          source: "provider",
+          reason: "Provider failed once",
+        },
+        event,
+        [event],
+      );
+      await fixture.runtime.run({
+        type: "resume",
+        threadId: "thr_one",
+        goalId: "goal_1",
+        expectedRevision: 2,
+      });
+      const duplicate = await fixture.runtime.recordFailure(
+        "thr_one",
+        {
+          kind: "ordinary",
+          source: "provider",
+          reason: "Provider failed once",
+        },
+        event,
+        [event],
+      );
+      expect(duplicate).toMatchObject({ state: "active", revision: 3 });
+      expect(
+        fixture.database
+          .prepare("SELECT COUNT(*) AS count FROM goal_failure_events")
+          .get(),
+      ).toEqual({ count: 1 });
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("does not pause a replacement Goal for a delayed predecessor failure", async () => {
+    const fixture = makeFixture();
+    try {
+      await fixture.runtime.run({
+        type: "start",
+        threadId: "thr_one",
+        objective: "finish the predecessor",
+      });
+      await fixture.runtime.run({
+        type: "cancel",
+        threadId: "thr_one",
+        goalId: "goal_1",
+        expectedRevision: 1,
+      });
+      await fixture.runtime.run({
+        type: "start",
+        threadId: "thr_one",
+        objective: "start a replacement",
+      });
+      const replacement = await fixture.runtime.recordFailure(
+        "thr_one",
+        {
+          kind: "ordinary",
+          source: "turn",
+          reason: "predecessor turn failed",
+        },
+        {
+          id: "event-predecessor-failure",
+          seq: 13,
+          createdAt: Date.parse("2026-08-22T11:59:59.000Z"),
+        },
+      );
+      expect(replacement).toMatchObject({
+        id: "goal_2",
+        state: "active",
+        revision: 1,
+      });
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("keeps an ineligible usage reset waiting until normal eligibility returns", async () => {
+    let snapshot: GoalThreadSnapshot = {
+      ...idleThreadSnapshot,
+      queuedMessageCount: 1,
+    };
+    let now = "2026-08-22T12:00:00.000Z";
+    const fixture = makeFixture(["thr_one"], {
+      readThread: async () => snapshot,
+      nowIso: () => now,
+    });
+    try {
+      await fixture.runtime.run({
+        type: "start",
+        threadId: "thr_one",
+        objective: "wait for queued user work",
+      });
+      await fixture.runtime.recordFailure("thr_one", {
+        kind: "usage-limit",
+        limitKind: "subscription-window",
+        reason: "Subscription window is exhausted",
+        resetAt: "2026-08-22T12:01:00.000Z",
+      });
+      expect(await fixture.runtime.recoverUsageLimits()).toEqual([]);
+      await expect(
+        fixture.runtime.run({ type: "status", threadId: "thr_one" }),
+      ).resolves.toMatchObject({ goal: { state: "waiting", revision: 2 } });
+
+      snapshot = idleThreadSnapshot;
+      now = "2026-08-22T12:01:00.000Z";
+      expect(await fixture.runtime.recoverUsageLimits()).toMatchObject([
+        { id: "goal_1", state: "active", revision: 3 },
+      ]);
     } finally {
       await fixture.close();
     }

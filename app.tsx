@@ -644,7 +644,7 @@ export function GoalComposerRow() {
             >
               Edit Goal
             </Button>
-            {view.goal.state === "active" ? (
+            {view.goal.state === "active" || view.goal.state === "waiting" ? (
               <Button
                 size="sm"
                 variant="ghost"

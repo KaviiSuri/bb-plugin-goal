@@ -16,6 +16,7 @@ import {
   type GoalCommandResult,
   type GoalDto,
   type GoalFailure,
+  type GoalFailureEventIdentity,
 } from "./domain";
 import { makeGoalRepositoryLayer } from "./repository";
 
@@ -28,6 +29,8 @@ export interface GoalRuntime {
   readonly recordFailure: (
     threadId: string,
     failure: GoalFailure,
+    event?: GoalFailureEventIdentity,
+    observedEvents?: readonly GoalFailureEventIdentity[],
   ) => Promise<GoalDto | null>;
   readonly recoverContinuations: () => Promise<void>;
   readonly recoverUsageLimits: () => Promise<readonly GoalDto[]>;
@@ -96,10 +99,16 @@ export function makeGoalRuntime(
         ),
       );
     },
-    async recordFailure(threadId, failure) {
+    async recordFailure(threadId, failure, event, observedEvents) {
       const result = await runtime.runPromise(
         GoalCoordinator.use((coordinator) =>
-          coordinator.execute({ type: "failure", threadId, failure }),
+          coordinator.execute({
+            type: "failure",
+            threadId,
+            failure,
+            event,
+            observedEvents,
+          }),
         ),
       );
       return "goal" in result ? result.goal : null;
