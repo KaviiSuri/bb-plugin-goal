@@ -6,7 +6,16 @@ import Database from "better-sqlite3";
 import { Effect } from "effect";
 import { it as effectIt } from "@effect/vitest";
 import { migrateGoalDatabase } from "./repository";
+import type { GoalThreadSnapshot } from "./coordinator";
 import { makeGoalRuntime, type GoalRuntime } from "./runtime";
+
+const idleThreadSnapshot = {
+  status: "idle",
+  runtimeStatus: "idle",
+  queuedMessageCount: 0,
+  activePromptMode: null,
+  pendingInteractionCount: 0,
+} as const;
 
 interface Fixture {
   readonly database: Database.Database;
@@ -16,7 +25,10 @@ interface Fixture {
   readonly close: () => Promise<void>;
 }
 
-function makeFixture(existingThreads: readonly string[] = ["thr_one"]): Fixture {
+function makeFixture(
+  existingThreads: readonly string[] = ["thr_one"],
+  options: { readonly readThread?: () => Promise<GoalThreadSnapshot> } = {},
+): Fixture {
   const directory = mkdtempSync(join(tmpdir(), "bb-goal-"));
   const database = new Database(join(directory, "goal.db"));
   migrateGoalDatabase(database);
@@ -26,7 +38,7 @@ function makeFixture(existingThreads: readonly string[] = ["thr_one"]): Fixture 
     database,
     {
       threadExists: async (threadId) => existingThreads.includes(threadId),
-      readThread: async () => ({ status: "idle" }),
+      readThread: options.readThread ?? (async () => idleThreadSnapshot),
       sendContinuation: async () => {
         continuationSends += 1;
       },
@@ -1066,7 +1078,7 @@ describe("Goal coordinator", () => {
         fixture.database,
         {
           threadExists: async () => true,
-          readThread: async () => ({ status: "idle" }),
+          readThread: async () => idleThreadSnapshot,
           sendContinuation: async () => {
             // The fixture's original adapter owns the observable count.
           },
@@ -1097,7 +1109,7 @@ describe("Goal coordinator", () => {
         fixture.database,
         {
           threadExists: async () => true,
-          readThread: async () => ({ status: "idle" }),
+          readThread: async () => idleThreadSnapshot,
           sendContinuation: async () => {
             // An ambiguous send is resolved without replay after restart.
           },
@@ -1141,7 +1153,7 @@ describe("Goal coordinator", () => {
         fixture.database,
         {
           threadExists: async () => true,
-          readThread: async () => ({ status: "idle" }),
+          readThread: async () => idleThreadSnapshot,
           sendContinuation: async () => {
             throw new Error("must not send stale Goal");
           },
@@ -1194,7 +1206,7 @@ describe("Goal coordinator", () => {
         fixture.database,
         {
           threadExists: async () => true,
-          readThread: async () => ({ status: "idle" }),
+          readThread: async () => idleThreadSnapshot,
           sendContinuation: async () => {},
         },
         {
@@ -1220,6 +1232,232 @@ describe("Goal coordinator", () => {
     } finally {
       if (fixture.database.open) fixture.database.close();
       rmSync(fixture.directory, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed on an authoritative read error and recovers the claim", async () => {
+    let failures = 1;
+    const fixture = makeFixture(["thr_one"], {
+      readThread: async () => {
+        if (failures > 0) {
+          failures -= 1;
+          throw new Error("authoritative BB read failed");
+        }
+        return idleThreadSnapshot;
+      },
+    });
+    try {
+      await fixture.runtime.run({
+        type: "start",
+        threadId: "thr_one",
+        objective: "recover after a BB read failure",
+      });
+      await fixture.runtime.enqueueIdle("thr_one", "read-failure");
+      await expect(
+        fixture.runtime.processContinuation(new AbortController().signal),
+      ).rejects.toThrow("Could not read thread thr_one");
+      expect(fixture.continuationSends()).toBe(0);
+      expect(
+        fixture.database
+          .prepare("SELECT state FROM goal_continuations")
+          .get(),
+      ).toEqual({ state: "claimed" });
+
+      await fixture.runtime.recoverContinuations();
+      await expect(
+        fixture.runtime.processContinuation(new AbortController().signal),
+      ).resolves.toBe(true);
+      expect(fixture.continuationSends()).toBe(1);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it.each([
+    {
+      name: "a queued user message",
+      snapshot: { ...idleThreadSnapshot, queuedMessageCount: 1 },
+      reason: "queued user message",
+    },
+    {
+      name: "an active thread",
+      snapshot: { ...idleThreadSnapshot, status: "active" },
+      reason: "thread status is active",
+    },
+    {
+      name: "a starting thread",
+      snapshot: { ...idleThreadSnapshot, runtimeStatus: "starting" },
+      reason: "thread runtime status is starting",
+    },
+    {
+      name: "a stopping thread",
+      snapshot: { ...idleThreadSnapshot, runtimeStatus: "stopping" },
+      reason: "thread runtime status is stopping",
+    },
+    {
+      name: "an errored thread",
+      snapshot: { ...idleThreadSnapshot, status: "error" },
+      reason: "thread status is error",
+    },
+    {
+      name: "a reconnecting thread",
+      snapshot: { ...idleThreadSnapshot, runtimeStatus: "host-reconnecting" },
+      reason: "thread runtime status is host-reconnecting",
+    },
+    {
+      name: "active Plan mode",
+      snapshot: { ...idleThreadSnapshot, activePromptMode: "plan" },
+      reason: "Plan mode is active",
+    },
+    {
+      name: "a pending interaction",
+      snapshot: { ...idleThreadSnapshot, pendingInteractionCount: 1 },
+      reason: "pending interaction",
+    },
+  ] as const)("releases a Continuation for $name before delivery", async ({ snapshot, reason }) => {
+    const fixture = makeFixture(["thr_one"], {
+      readThread: async () => snapshot,
+    });
+    try {
+      await fixture.runtime.run({
+        type: "start",
+        threadId: "thr_one",
+        objective: "yield to user work",
+      });
+      await fixture.runtime.enqueueIdle("thr_one", `claim-${reason}`);
+      await expect(
+        fixture.runtime.processContinuation(new AbortController().signal),
+      ).resolves.toBe(true);
+      expect(fixture.continuationSends()).toBe(0);
+      expect(
+        fixture.database
+          .prepare(
+            "SELECT state, outcome, outcome_reason FROM goal_continuations",
+          )
+          .get(),
+      ).toMatchObject({
+        state: "resolved",
+        outcome: "released",
+        outcome_reason: expect.stringContaining(reason),
+      });
+      await expect(
+        fixture.runtime.run({ type: "status", threadId: "thr_one" }),
+      ).resolves.toMatchObject({ ok: true, goal: { state: "active" } });
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it.each([
+    {
+      name: "a queued user message arriving late",
+      snapshot: { ...idleThreadSnapshot, queuedMessageCount: 1 },
+      reason: "queued user message",
+      goalChange: undefined,
+    },
+    {
+      name: "an active turn starting late",
+      snapshot: { ...idleThreadSnapshot, status: "active" },
+      reason: "thread status is active",
+      goalChange: undefined,
+    },
+    {
+      name: "Plan mode entered late",
+      snapshot: { ...idleThreadSnapshot, activePromptMode: "plan" },
+      reason: "Plan mode is active",
+      goalChange: undefined,
+    },
+    {
+      name: "an interaction arriving late",
+      snapshot: { ...idleThreadSnapshot, pendingInteractionCount: 1 },
+      reason: "pending interaction",
+      goalChange: undefined,
+    },
+    {
+      name: "a Goal revision change late",
+      snapshot: idleThreadSnapshot,
+      reason: "Goal revision changed before send",
+      goalChange: "revision" as const,
+    },
+    {
+      name: "a Goal state change late",
+      snapshot: idleThreadSnapshot,
+      reason: "Goal state is paused before send",
+      goalChange: "state" as const,
+    },
+  ] as const)("releases instead of sending when $name", async ({ snapshot, reason, goalChange }) => {
+    let reads = 0;
+    let database: Database.Database | undefined;
+    const fixture = makeFixture(["thr_one"], {
+      readThread: async () => {
+        reads += 1;
+        if (reads === 2 && goalChange !== undefined) {
+          if (goalChange === "revision") {
+            database!.prepare("UPDATE goals SET revision = 2 WHERE id = ?").run("goal_1");
+          } else {
+            database!.prepare("UPDATE goals SET state = 'paused' WHERE id = ?").run("goal_1");
+          }
+        }
+        return reads === 1 ? idleThreadSnapshot : snapshot;
+      },
+    });
+    database = fixture.database;
+    try {
+      await fixture.runtime.run({
+        type: "start",
+        threadId: "thr_one",
+        objective: "yield to late user work",
+      });
+      await fixture.runtime.enqueueIdle("thr_one", `late-${reason}`);
+      await expect(
+        fixture.runtime.processContinuation(new AbortController().signal),
+      ).resolves.toBe(true);
+      expect(reads).toBe(2);
+      expect(fixture.continuationSends()).toBe(0);
+      expect(
+        fixture.database
+          .prepare(
+            "SELECT state, outcome, outcome_reason FROM goal_continuations",
+          )
+          .get(),
+      ).toMatchObject({
+        state: "resolved",
+        outcome: "released",
+        outcome_reason: expect.stringContaining(reason),
+      });
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("sends once at a distinct later idle opportunity after queued work clears", async () => {
+    let queued = true;
+    const fixture = makeFixture(["thr_one"], {
+      readThread: async () => ({
+        ...idleThreadSnapshot,
+        queuedMessageCount: queued ? 1 : 0,
+      }),
+    });
+    try {
+      await fixture.runtime.run({
+        type: "start",
+        threadId: "thr_one",
+        objective: "wait for the user message",
+      });
+      await fixture.runtime.enqueueIdle("thr_one", "idle-with-user-work");
+      await expect(
+        fixture.runtime.processContinuation(new AbortController().signal),
+      ).resolves.toBe(true);
+      expect(fixture.continuationSends()).toBe(0);
+
+      queued = false;
+      await fixture.runtime.enqueueIdle("thr_one", "idle-after-user-work");
+      await expect(
+        fixture.runtime.processContinuation(new AbortController().signal),
+      ).resolves.toBe(true);
+      expect(fixture.continuationSends()).toBe(1);
+    } finally {
+      await fixture.close();
     }
   });
 

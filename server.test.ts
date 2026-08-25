@@ -79,6 +79,9 @@ function fakeHost() {
             environmentId: "env_test",
           });
         },
+        queuedMessages: { list: async () => [] },
+        interactions: { list: async () => [] },
+        timeline: async () => ({ rows: [], activePromptMode: null }),
       },
       environments: {
         get: async () => ({ hostId: "host_test" }),
@@ -155,6 +158,9 @@ describe("Goal BB adapter", () => {
             sends += 1;
             return { ok: true };
           },
+          queuedMessages: { list: async () => [] },
+          interactions: { list: async () => [] },
+          timeline: async () => ({ rows: [], activePromptMode: null }),
         },
       },
     });
@@ -182,6 +188,180 @@ describe("Goal BB adapter", () => {
       expect(
         harness.inspection.sdk.callsTo("threads.send"),
       ).toHaveLength(1);
+    } finally {
+      service.controller.abort();
+      await service.done;
+      await harness.lifecycle.dispose();
+    }
+  });
+
+  it.each([
+    {
+      name: "queued user work",
+      queued: true,
+      status: "idle",
+      runtimeStatus: "idle",
+      plan: false,
+      interaction: false,
+      reason: "queued user message",
+    },
+    {
+      name: "an active turn",
+      queued: false,
+      status: "active",
+      runtimeStatus: "active",
+      plan: false,
+      interaction: false,
+      reason: "thread status is active",
+    },
+    {
+      name: "Plan mode",
+      queued: false,
+      status: "idle",
+      runtimeStatus: "idle",
+      plan: true,
+      interaction: false,
+      reason: "Plan mode is active",
+    },
+    {
+      name: "a pending interaction",
+      queued: false,
+      status: "idle",
+      runtimeStatus: "idle",
+      plan: false,
+      interaction: true,
+      reason: "pending interaction",
+    },
+  ] as const)("uses authoritative BB reads to suspend for $name", async (precedence) => {
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "goal",
+      sdk: {
+        threads: {
+          get: async ({ threadId }) =>
+            makeThreadResponse({
+              id: threadId,
+              status: precedence.status,
+              runtime: {
+                displayStatus: precedence.runtimeStatus,
+                hostReconnectGraceExpiresAt: null,
+              },
+              environmentId: "env_test",
+            }),
+          send: async () => ({ ok: true }),
+          queuedMessages: {
+            list: async () => (precedence.queued ? [{}] : []),
+          },
+          interactions: {
+            list: async () => (precedence.interaction ? [{ status: "pending" }] : []),
+          },
+          timeline: async () => ({
+            rows: [],
+            activePromptMode: precedence.plan
+              ? { mode: "plan", prompt: "plan", providerId: "pi" }
+              : null,
+          }),
+        },
+      },
+    });
+    await deterministicPlugin()(bb);
+    const service = harness.behavior.runService("continuations");
+    try {
+      await harness.behavior.callRpc("start", {
+        threadId: "thr_precedence",
+        objective: "yield to authoritative user activity",
+      });
+      await harness.behavior.emitThreadEvent("thread.idle", {
+        thread: makeThreadResponse({
+          id: "thr_precedence",
+          status: "idle",
+          updatedAt: 42,
+          environmentId: "env_test",
+        }),
+        lastAssistantText: null,
+      });
+      const database = bb.storage.database();
+      await waitUntil(() =>
+        (database
+          .prepare("SELECT state FROM goal_continuations")
+          .get() as { readonly state: string } | undefined)?.state === "resolved",
+      );
+      expect(harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+      expect(
+        database
+          .prepare("SELECT state, outcome, outcome_reason FROM goal_continuations")
+          .get(),
+      ).toMatchObject({
+        state: "resolved",
+        outcome: "released",
+        outcome_reason: expect.stringContaining(precedence.reason),
+      });
+      await expect(
+        harness.behavior.callRpc("status", { threadId: "thr_precedence" }),
+      ).resolves.toMatchObject({ goal: { state: "active" } });
+    } finally {
+      service.controller.abort();
+      await service.done;
+      await harness.lifecycle.dispose();
+    }
+  });
+
+  it("rechecks the fake host after sending is claimed and releases a late queued message", async () => {
+    let readCount = 0;
+    let queued = false;
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "goal",
+      sdk: {
+        threads: {
+          get: async ({ threadId }) => {
+            readCount += 1;
+            if (readCount === 2) queued = true;
+            return makeThreadResponse({
+              id: threadId,
+              status: "idle",
+              environmentId: "env_test",
+            });
+          },
+          send: async () => ({ ok: true }),
+          queuedMessages: { list: async () => (queued ? [{}] : []) },
+          interactions: { list: async () => [] },
+          timeline: async () => ({ rows: [], activePromptMode: null }),
+        },
+      },
+    });
+    await deterministicPlugin()(bb);
+    const service = harness.behavior.runService("continuations");
+    try {
+      await harness.behavior.callRpc("start", {
+        threadId: "thr_late_precedence",
+        objective: "never overtake a late user message",
+      });
+      readCount = 0;
+      await harness.behavior.emitThreadEvent("thread.idle", {
+        thread: makeThreadResponse({
+          id: "thr_late_precedence",
+          status: "idle",
+          updatedAt: 42,
+          environmentId: "env_test",
+        }),
+        lastAssistantText: null,
+      });
+      const database = bb.storage.database();
+      await waitUntil(() =>
+        (database
+          .prepare("SELECT state FROM goal_continuations")
+          .get() as { readonly state: string } | undefined)?.state === "resolved",
+      );
+      expect(readCount).toBe(2);
+      expect(harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+      expect(
+        database
+          .prepare("SELECT state, outcome, outcome_reason FROM goal_continuations")
+          .get(),
+      ).toMatchObject({
+        state: "resolved",
+        outcome: "released",
+        outcome_reason: expect.stringContaining("queued user message"),
+      });
     } finally {
       service.controller.abort();
       await service.done;
@@ -225,6 +405,9 @@ describe("Goal BB adapter", () => {
             sends += 1;
             return { ok: true };
           },
+          queuedMessages: { list: async () => [] },
+          interactions: { list: async () => [] },
+          timeline: async () => ({ rows: [], activePromptMode: null }),
         },
       },
     });
@@ -299,6 +482,9 @@ describe("Goal BB adapter", () => {
             sentThreads.push(threadId);
             return { ok: true };
           },
+          queuedMessages: { list: async () => [] },
+          interactions: { list: async () => [] },
+          timeline: async () => ({ rows: [], activePromptMode: null }),
         },
       },
     });
@@ -429,7 +615,9 @@ describe("Goal BB adapter", () => {
             }
             return { ok: true };
           },
-          timeline: async () => ({ rows: timelineRows }),
+          timeline: async () => ({ rows: timelineRows, activePromptMode: null }),
+          queuedMessages: { list: async () => [] },
+          interactions: { list: async () => [] },
         },
       },
     });

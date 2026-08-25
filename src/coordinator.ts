@@ -20,8 +20,97 @@ import {
   type GoalContinuationRecord,
 } from "./repository";
 
+export type GoalThreadStatus =
+  | "active"
+  | "error"
+  | "idle"
+  | "starting"
+  | "stopping";
+
+export type GoalThreadRuntimeStatus =
+  | "host-reconnecting"
+  | "waiting-for-host"
+  | "active"
+  | "error"
+  | "idle"
+  | "provisioning"
+  | "starting"
+  | "stopping";
+
 export interface GoalThreadSnapshot {
-  readonly status: string;
+  readonly status: GoalThreadStatus;
+  readonly runtimeStatus: GoalThreadRuntimeStatus;
+  readonly queuedMessageCount: number;
+  readonly activePromptMode: "plan" | null;
+  readonly pendingInteractionCount: number;
+}
+
+export type GoalContinuationEligibilityReasonCode =
+  | "queued-user-message"
+  | "thread-status"
+  | "thread-runtime-status"
+  | "plan-mode"
+  | "pending-interaction";
+
+export interface GoalContinuationEligibilityReason {
+  readonly code: GoalContinuationEligibilityReasonCode;
+  readonly message: string;
+}
+
+export interface GoalContinuationEligibility {
+  readonly eligible: boolean;
+  readonly reason: GoalContinuationEligibilityReason | null;
+}
+
+export function goalContinuationEligibility(
+  snapshot: GoalThreadSnapshot,
+): GoalContinuationEligibility {
+  if (snapshot.queuedMessageCount > 0) {
+    return {
+      eligible: false,
+      reason: {
+        code: "queued-user-message",
+        message: `${snapshot.queuedMessageCount} queued user message(s)`,
+      },
+    };
+  }
+  if (snapshot.status !== "idle") {
+    return {
+      eligible: false,
+      reason: {
+        code: "thread-status",
+        message: `thread status is ${snapshot.status}`,
+      },
+    };
+  }
+  if (snapshot.runtimeStatus !== "idle") {
+    return {
+      eligible: false,
+      reason: {
+        code: "thread-runtime-status",
+        message: `thread runtime status is ${snapshot.runtimeStatus}`,
+      },
+    };
+  }
+  if (snapshot.activePromptMode === "plan") {
+    return {
+      eligible: false,
+      reason: {
+        code: "plan-mode",
+        message: "Plan mode is active",
+      },
+    };
+  }
+  if (snapshot.pendingInteractionCount > 0) {
+    return {
+      eligible: false,
+      reason: {
+        code: "pending-interaction",
+        message: `${snapshot.pendingInteractionCount} pending interaction(s)`,
+      },
+    };
+  }
+  return { eligible: true, reason: null };
 }
 
 export interface GoalThreadGatewayAdapter {
@@ -447,28 +536,43 @@ export class GoalContinuationCoordinator extends Context.Service<
           const continuation = yield* repository.claimContinuation(lease);
           if (continuation === null) return { kind: "idle" as const };
 
+          const release = (reason: string) =>
+            repository.resolveContinuation({
+              id: continuation.id,
+              now: lease.now,
+              outcome: "released",
+              reason,
+            });
           const current = yield* repository.current(continuation.threadId);
           const thread = yield* gateway.readThread(
             continuation.threadId,
             signal,
           );
-          if (
-            signal?.aborted === true ||
-            current === null ||
-            current.id !== continuation.goalId ||
-            current.revision !== continuation.goalRevision ||
-            current.state !== "active" ||
-            thread.status !== "idle"
-          ) {
-            yield* repository.resolveContinuation({
-              id: continuation.id,
-              now: lease.now,
-              outcome: "released",
-              reason:
-                signal?.aborted === true
-                  ? "plugin cancellation"
-                  : "Goal or thread was no longer eligible",
-            });
+          const firstEligibility = goalContinuationEligibility(thread);
+          if (signal?.aborted === true) {
+            yield* release("plugin cancellation");
+            return { kind: "released" as const, continuation };
+          }
+          if (current === null) {
+            yield* release("Goal no longer exists");
+            return { kind: "released" as const, continuation };
+          }
+          if (current.id !== continuation.goalId) {
+            yield* release("A different Goal is active");
+            return { kind: "released" as const, continuation };
+          }
+          if (current.revision !== continuation.goalRevision) {
+            yield* release("Goal revision changed");
+            return { kind: "released" as const, continuation };
+          }
+          if (current.state !== "active") {
+            yield* release(`Goal state is ${current.state}`);
+            return { kind: "released" as const, continuation };
+          }
+          if (!firstEligibility.eligible) {
+            yield* release(
+              `Suspended before claim delivery: ${firstEligibility.reason!.message}`,
+            );
             return { kind: "released" as const, continuation };
           }
 
@@ -483,6 +587,41 @@ export class GoalContinuationCoordinator extends Context.Service<
           });
           if (!markedSending) return { kind: "released" as const, continuation };
 
+          const threadBeforeSend = yield* gateway.readThread(
+            continuation.threadId,
+            signal,
+          );
+          const currentBeforeSend = yield* repository.current(
+            continuation.threadId,
+          );
+          const lateEligibility = goalContinuationEligibility(threadBeforeSend);
+          if (signal !== undefined && Boolean(signal.aborted)) {
+            yield* release("plugin cancellation");
+            return { kind: "released" as const, continuation };
+          }
+          if (currentBeforeSend === null) {
+            yield* release("Goal no longer exists before send");
+            return { kind: "released" as const, continuation };
+          }
+          if (currentBeforeSend.id !== continuation.goalId) {
+            yield* release("A different Goal is active before send");
+            return { kind: "released" as const, continuation };
+          }
+          if (currentBeforeSend.revision !== continuation.goalRevision) {
+            yield* release("Goal revision changed before send");
+            return { kind: "released" as const, continuation };
+          }
+          if (currentBeforeSend.state !== "active") {
+            yield* release(`Goal state is ${currentBeforeSend.state} before send`);
+            return { kind: "released" as const, continuation };
+          }
+          if (!lateEligibility.eligible) {
+            yield* release(
+              `Suspended immediately before send: ${lateEligibility.reason!.message}`,
+            );
+            return { kind: "released" as const, continuation };
+          }
+
           try {
             yield* gateway.sendContinuation(
               continuation.threadId,
@@ -490,12 +629,9 @@ export class GoalContinuationCoordinator extends Context.Service<
               signal,
             );
           } catch (cause) {
-            yield* repository.resolveContinuation({
-              id: continuation.id,
-              now: lease.now,
-              outcome: "released",
-              reason: cause instanceof Error ? cause.message : String(cause),
-            });
+            yield* release(
+              cause instanceof Error ? cause.message : String(cause),
+            );
             return { kind: "released" as const, continuation };
           }
 

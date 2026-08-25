@@ -777,8 +777,29 @@ export function createPlugin(
         }
       },
       async readThread(threadId, signal) {
-        const thread = await bb.sdk.threads.get({ threadId, signal });
-        return { status: thread.status };
+        const [thread, queuedMessages, interactions, timeline] =
+          await Promise.all([
+            bb.sdk.threads.get({ threadId, signal }),
+            bb.sdk.threads.queuedMessages.list({ threadId, signal }),
+            bb.sdk.threads.interactions.list({ threadId, signal }),
+            bb.sdk.threads.timeline({
+              threadId,
+              signal,
+              segmentLimit: "1",
+              summaryOnly: "false",
+            }),
+          ]);
+        return {
+          status: thread.status,
+          runtimeStatus: thread.runtime.displayStatus,
+          queuedMessageCount: queuedMessages.length,
+          activePromptMode: timeline.activePromptMode?.mode ?? null,
+          pendingInteractionCount: interactions.filter(
+            (interaction) =>
+              interaction.status !== "resolved" &&
+              interaction.status !== "interrupted",
+          ).length,
+        };
       },
       async sendContinuation(threadId, deliveryMarker, signal) {
         if (signal?.aborted === true) {
