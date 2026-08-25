@@ -19,6 +19,8 @@ const activeGoal = {
   createdAt: "2026-08-22T12:00:00.000Z",
   updatedAt: "2026-08-22T12:00:00.000Z",
   finishedAt: null,
+  completionSummary: null,
+  verificationEvidence: null,
 };
 
 type RpcHandlers = PluginRpcTestHandlers<typeof rpcContract>;
@@ -355,6 +357,32 @@ describe("Goal composer row", () => {
         revision: 2,
       });
       expect(await slot.findByText("Updated outside the panel")).toBeTruthy();
+    } finally {
+      slot.lifecycle.unmount();
+    }
+  });
+
+  it("shows Completion summary and verification evidence in history", async () => {
+    const completed: Goal = {
+      ...activeGoal,
+      state: "completed",
+      revision: 2,
+      finishedAt: "2026-08-22T12:05:00.000Z",
+      completionSummary: "Implemented the guarded Completion path.",
+      verificationEvidence: "Coordinator, fake-host, and UI tests pass.",
+    };
+    const slot = renderSlot<
+      { threadId: string; params: JsonValue | null },
+      typeof rpcContract
+    >(
+      historyPanel(),
+      { threadId: "thr_ui", params: null },
+      { rpc: handlers(completed) },
+    );
+    try {
+      expect(await slot.findByText("Completed Goal")).toBeTruthy();
+      expect(slot.getByText(completed.completionSummary!)).toBeTruthy();
+      expect(slot.getByText(completed.verificationEvidence!)).toBeTruthy();
     } finally {
       slot.lifecycle.unmount();
     }

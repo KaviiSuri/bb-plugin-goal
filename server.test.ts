@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import type { PluginAgentConfigurationContext } from "@get-bb/plugin-sdk";
 import {
   createFakePluginHost,
   makeThreadResponse,
@@ -20,6 +21,39 @@ function deterministicPlugin() {
       });
     },
   });
+}
+
+function agentContext(
+  providerId: string,
+): PluginAgentConfigurationContext {
+  return {
+    thread: {
+      id: "thr_agent",
+      title: "Goal agent",
+      parentThreadId: null,
+      sourceThreadId: null,
+    },
+    project: {
+      id: "proj_test",
+      kind: "standard",
+      name: "Goal test",
+      gitRemoteUrl: null,
+    },
+    environment: {
+      id: "env_test",
+      name: "Goal environment",
+      path: "/workspace",
+      workspaceProvisionType: "managed-worktree",
+      branchName: "test",
+    },
+    host: { id: "host_test", name: "test host" },
+    provider: {
+      id: providerId,
+      model: "test-model",
+      capabilities: { supportsNativeUserQuestion: false },
+    },
+    origin: { kind: null, pluginId: null },
+  };
 }
 
 function fakeHost() {
@@ -67,6 +101,12 @@ describe("Goal BB adapter", () => {
         "show",
         "delete",
       ]);
+      expect(harness.inspection.registrations.agentTools).toMatchObject([
+        { name: "goal_complete" },
+      ]);
+      expect(
+        harness.inspection.registrations.agentConfigurationProvider,
+      ).not.toBeNull();
       expect(harness.inspection.registrations.cli).toMatchObject({
         name: "goal",
         commands: [
@@ -81,6 +121,246 @@ describe("Goal BB adapter", () => {
           { name: "delete" },
         ],
       });
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
+  it("contributes the same bounded active Goal context to every provider without running Effect", async () => {
+    let runtimeRuns = 0;
+    const observedPlugin = createPlugin({
+      makeRuntime(database, gateway): GoalRuntime {
+        const runtime = makeGoalRuntime(database, gateway, {
+          nextGoalId: () => "goal_agent",
+          nowIso: () => "2026-08-22T12:00:00.000Z",
+        });
+        return {
+          async run(command) {
+            runtimeRuns += 1;
+            return runtime.run(command);
+          },
+          dispose: runtime.dispose,
+        };
+      },
+    });
+    const { bb, harness } = fakeHost();
+    await observedPlugin(bb);
+    try {
+      const empty = await harness.behavior.resolveAgentConfiguration(
+        agentContext("pi"),
+      );
+      expect(empty).toEqual({ tools: [], skills: [], instructions: null });
+      expect(runtimeRuns).toBe(0);
+
+      await harness.behavior.callRpc("start", {
+        threadId: "thr_agent",
+        objective: "Finish the provider-independent Completion path.",
+      });
+      expect(runtimeRuns).toBe(1);
+      const gatewayCalls = harness.inspection.sdk.callsTo("threads.get").length;
+
+      for (const providerId of ["pi", "claude-code", "codex", "acp-test"]) {
+        const configuration =
+          await harness.behavior.resolveAgentConfiguration(
+            agentContext(providerId),
+          );
+        expect(configuration.instructions).toContain(
+          "Exact Goal ID: goal_agent",
+        );
+        expect(configuration.instructions).toContain("Goal revision: 1");
+        expect(configuration.instructions).toContain(
+          "Finish the provider-independent Completion path.",
+        );
+        expect(configuration.instructions).toContain(
+          "Only the user may edit, pause, resume, cancel, or delete this Goal.",
+        );
+        expect(configuration.instructions).toContain(
+          "Call goal_complete only after every requirement is satisfied and verified.",
+        );
+        expect(configuration.instructions!.length).toBeLessThanOrEqual(4096);
+        expect(configuration.tools).toHaveLength(1);
+        expect(configuration.tools[0]).toMatchObject({
+          name: "goal_complete",
+          inputSchema: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              goalId: { const: "goal_agent" },
+              expectedRevision: { const: 1 },
+            },
+          },
+        });
+      }
+
+      expect(runtimeRuns).toBe(1);
+      expect(harness.inspection.sdk.callsTo("threads.get")).toHaveLength(
+        gatewayCalls,
+      );
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
+  it("guards agent Completion end to end and publishes plain terminal DTOs", async () => {
+    const { bb, harness } = fakeHost();
+    await deterministicPlugin()(bb);
+    try {
+      const started = (await harness.behavior.callRpc("start", {
+        threadId: "thr_agent",
+        objective: "Finish guarded Completion",
+      })) as { goal: GoalDto };
+
+      await expect(
+        harness.behavior.callAgentTool(
+          "goal_complete",
+          {
+            goalId: started.goal.id,
+            expectedRevision: 1,
+            summary: "Implemented Completion",
+          },
+          { threadId: "thr_agent" },
+        ),
+      ).rejects.toThrow(/verificationEvidence/);
+      await expect(
+        harness.behavior.callAgentTool(
+          "goal_complete",
+          {
+            goalId: "goal_wrong",
+            expectedRevision: 1,
+            summary: "Implemented Completion",
+            verificationEvidence: "Tests pass",
+          },
+          { threadId: "thr_agent" },
+        ),
+      ).rejects.toThrow("[goal_not_found]");
+
+      const edited = (await harness.behavior.callRpc("edit", {
+        threadId: "thr_agent",
+        goalId: started.goal.id,
+        expectedRevision: 1,
+        objective: "Finish guarded Completion with history",
+      })) as { goal: GoalDto };
+      await expect(
+        harness.behavior.callAgentTool(
+          "goal_complete",
+          {
+            goalId: started.goal.id,
+            expectedRevision: 1,
+            summary: "Stale summary",
+            verificationEvidence: "Stale evidence",
+          },
+          { threadId: "thr_agent" },
+        ),
+      ).rejects.toThrow("[stale_goal]");
+
+      const toolResult = await harness.behavior.callAgentTool(
+        "goal_complete",
+        {
+          goalId: edited.goal.id,
+          expectedRevision: edited.goal.revision,
+          summary: "Implemented guarded Completion.",
+          verificationEvidence: "Coordinator and fake-host tests pass.",
+        },
+        { threadId: "thr_agent" },
+      );
+      expect(toolResult).toMatchObject({
+        content: [{ type: "text" }],
+      });
+      if (typeof toolResult === "string") {
+        throw new Error("Expected a structured tool result");
+      }
+      const content = toolResult.content[0];
+      if (content?.type !== "text") {
+        throw new Error("Expected text tool content");
+      }
+      const toolDto = JSON.parse(content.text) as { goal: GoalDto };
+      expect(toolDto).toMatchObject({
+        goal: {
+          id: edited.goal.id,
+          threadId: "thr_agent",
+          objective: "Finish guarded Completion with history",
+          state: "completed",
+          revision: 3,
+          completionSummary: "Implemented guarded Completion.",
+          verificationEvidence: "Coordinator and fake-host tests pass.",
+        },
+      });
+      expect(toolDto.goal.finishedAt).not.toBeNull();
+      expect(toolDto.goal.updatedAt).toBe(toolDto.goal.finishedAt);
+      expect(Object.getPrototypeOf(toolDto.goal)).toBe(Object.prototype);
+      expect(harness.inspection.realtimeSignals).toHaveLength(3);
+      expect(harness.inspection.realtimeSignals.at(-1)).toMatchObject({
+        channel: "goal.changed",
+        payload: {
+          threadId: "thr_agent",
+          goalId: edited.goal.id,
+          revision: 3,
+          state: "completed",
+        },
+      });
+      await expect(
+        harness.behavior.callRpc("status", { threadId: "thr_agent" }),
+      ).resolves.toEqual({ goal: null });
+      await expect(
+        harness.behavior.callRpc("history", {
+          threadId: "thr_agent",
+          limit: 20,
+          cursor: null,
+        }),
+      ).resolves.toMatchObject({
+        goals: [
+          {
+            id: edited.goal.id,
+            state: "completed",
+            completionSummary: "Implemented guarded Completion.",
+            verificationEvidence: "Coordinator and fake-host tests pass.",
+          },
+        ],
+      });
+
+      await expect(
+        harness.behavior.callAgentTool(
+          "goal_complete",
+          {
+            goalId: edited.goal.id,
+            expectedRevision: 3,
+            summary: "Repeated Completion",
+            verificationEvidence: "Repeated evidence",
+          },
+          { threadId: "thr_agent" },
+        ),
+      ).rejects.toThrow("[invalid_transition]");
+
+      const replacement = (await harness.behavior.callRpc("start", {
+        threadId: "thr_agent",
+        objective: "Replacement Goal",
+      })) as { goal: GoalDto };
+      await expect(
+        harness.behavior.callAgentTool(
+          "goal_complete",
+          {
+            goalId: edited.goal.id,
+            expectedRevision: 3,
+            summary: "Old turn",
+            verificationEvidence: "Old evidence",
+          },
+          { threadId: "thr_agent" },
+        ),
+      ).rejects.toThrow("[invalid_transition]");
+      await expect(
+        harness.behavior.callRpc("status", { threadId: "thr_agent" }),
+      ).resolves.toEqual({ goal: replacement.goal });
+
+      const shown = await harness.behavior.runCli([
+        "show",
+        edited.goal.id,
+      ]);
+      expect(shown.stdout).toContain(
+        "Completion summary: Implemented guarded Completion.",
+      );
+      expect(shown.stdout).toContain(
+        "Verification evidence: Coordinator and fake-host tests pass.",
+      );
     } finally {
       await harness.lifecycle.dispose();
     }

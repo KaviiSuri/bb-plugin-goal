@@ -16,7 +16,10 @@ import {
   type GoalHistoryPage,
   type GoalMutationType,
 } from "./src/domain";
-import { GOAL_MIGRATIONS } from "./src/repository";
+import {
+  GOAL_MIGRATIONS,
+  makeCurrentGoalSnapshotReader,
+} from "./src/repository";
 import { makeGoalRuntime, type GoalRuntime } from "./src/runtime";
 
 export const GOAL_REALTIME_CHANNEL = "goal.changed";
@@ -31,6 +34,17 @@ const goalSchema = z
     createdAt: z.string(),
     updatedAt: z.string(),
     finishedAt: z.string().nullable(),
+    completionSummary: z.string().nullable(),
+    verificationEvidence: z.string().nullable(),
+  })
+  .strict();
+
+export const goalCompleteInputSchema = z
+  .object({
+    goalId: z.string().min(1),
+    expectedRevision: z.number().int().positive(),
+    summary: z.string().trim().min(1),
+    verificationEvidence: z.string().trim().min(1),
   })
   .strict();
 
@@ -133,6 +147,12 @@ function formatGoal(goal: GoalDto, heading: string): string {
     `State: ${goal.state}`,
     `Revision: ${goal.revision}`,
     `Objective: ${goal.objective}`,
+    ...(goal.completionSummary === null
+      ? []
+      : [`Completion summary: ${goal.completionSummary}`]),
+    ...(goal.verificationEvidence === null
+      ? []
+      : [`Verification evidence: ${goal.verificationEvidence}`]),
   ].join("\n");
 }
 
@@ -146,6 +166,7 @@ function resultExitCode(result: GoalCommandResult): number {
     case "invalid_arguments":
     case "invalid_cursor":
     case "invalid_objective":
+    case "invalid_completion":
       return 2;
     case "thread_not_found":
     case "goal_not_found":
@@ -389,6 +410,49 @@ async function readObjectiveFile(
   return file.contentEncoding === "base64"
     ? Buffer.from(file.content, "base64").toString("utf8")
     : file.content;
+}
+
+function goalAgentInstructions(goal: GoalDto): string {
+  const rules = [
+    "An active BB Goal governs this thread.",
+    `Exact Goal ID: ${goal.id}`,
+    `Goal revision: ${goal.revision}`,
+    "Keep working until the full objective is complete. Do not stop after only a plan or partial progress.",
+    "Only the user may edit, pause, resume, cancel, or delete this Goal.",
+    "Call goal_complete only after every requirement is satisfied and verified. Pass the exact Goal ID and revision shown here, a concrete completion summary, and verification evidence.",
+    "A stale Goal ID or revision cannot complete an edited, terminal, or replacement Goal.",
+    "Objective:",
+  ].join("\n");
+  const maxLength = 4096;
+  const remaining = Math.max(0, maxLength - rules.length - 1);
+  const truncationMarker = "\n[Objective truncated by BB limit]";
+  const objective =
+    goal.objective.length <= remaining
+      ? goal.objective
+      : `${goal.objective.slice(
+          0,
+          Math.max(0, remaining - truncationMarker.length),
+        )}${truncationMarker}`;
+  return `${rules}\n${objective}`;
+}
+
+function goalCompleteParameters(goal: GoalDto): Record<string, unknown> {
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: [
+      "goalId",
+      "expectedRevision",
+      "summary",
+      "verificationEvidence",
+    ],
+    properties: {
+      goalId: { type: "string", const: goal.id },
+      expectedRevision: { type: "integer", const: goal.revision },
+      summary: { type: "string", minLength: 1 },
+      verificationEvidence: { type: "string", minLength: 1 },
+    },
+  };
 }
 
 function publishGoalChanged(
@@ -663,6 +727,56 @@ export function createPlugin(
           return false;
         }
       },
+    });
+    const snapshots = makeCurrentGoalSnapshotReader(database);
+
+    bb.agents.registerTool({
+      name: "goal_complete",
+      description:
+        "Mark the active BB Goal completed after all required work is done and verified.",
+      instructions:
+        "Use only for the active BB Goal. Include its exact ID and revision, a completion summary, and concrete verification evidence.",
+      experimental_statusLabels: {
+        pending: "Completing Goal",
+        completed: "Completed Goal",
+      },
+      parameters: goalCompleteInputSchema,
+      async execute(input, context) {
+        const goal = requireGoalSuccessful(
+          await runtime.run({
+            type: "complete",
+            threadId: context.threadId,
+            ...input,
+          }),
+        );
+        if (goal === null) throw new Error("Goal Completion returned no Goal.");
+        publishGoalChanged(bb, goal);
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({ goal }),
+            },
+          ],
+        };
+      },
+    });
+
+    bb.agents.configure((context) => {
+      const goal = snapshots.current(context.thread.id);
+      if (goal === null || goal.state !== "active") {
+        return { tools: [], skills: [] };
+      }
+      return {
+        tools: [
+          {
+            name: "goal_complete",
+            parameters: goalCompleteParameters(goal),
+          },
+        ],
+        skills: [],
+        instructions: goalAgentInstructions(goal),
+      };
     });
 
     async function mutate(

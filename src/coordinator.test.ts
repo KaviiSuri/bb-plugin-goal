@@ -138,6 +138,147 @@ describe("Goal coordinator", () => {
     }
   });
 
+  it("atomically completes only the exact active Goal revision with evidence", async () => {
+    const fixture = makeFixture();
+    try {
+      await fixture.runtime.run({
+        type: "start",
+        threadId: "thr_one",
+        objective: "ship guarded Completion",
+      });
+
+      await expect(
+        fixture.runtime.run({
+          type: "complete",
+          threadId: "thr_one",
+          goalId: "goal_1",
+          expectedRevision: 1,
+          summary: "implemented",
+          verificationEvidence: "   ",
+        }),
+      ).resolves.toEqual({
+        ok: false,
+        error: {
+          code: "invalid_completion",
+          message:
+            "Goal Completion requires a summary and verification evidence.",
+        },
+      });
+
+      await expect(
+        fixture.runtime.run({
+          type: "complete",
+          threadId: "thr_one",
+          goalId: "goal_wrong",
+          expectedRevision: 1,
+          summary: "implemented",
+          verificationEvidence: "tests pass",
+        }),
+      ).resolves.toMatchObject({
+        ok: false,
+        error: { code: "goal_not_found" },
+      });
+
+      await fixture.runtime.run({
+        type: "edit",
+        threadId: "thr_one",
+        goalId: "goal_1",
+        expectedRevision: 1,
+        objective: "ship guarded Completion and history evidence",
+      });
+      await expect(
+        fixture.runtime.run({
+          type: "complete",
+          threadId: "thr_one",
+          goalId: "goal_1",
+          expectedRevision: 1,
+          summary: "implemented",
+          verificationEvidence: "tests pass",
+        }),
+      ).resolves.toMatchObject({
+        ok: false,
+        error: { code: "stale_goal" },
+      });
+
+      const completed = await fixture.runtime.run({
+        type: "complete",
+        threadId: "thr_one",
+        goalId: "goal_1",
+        expectedRevision: 2,
+        summary: "  Implemented guarded Completion.  ",
+        verificationEvidence: "  Coordinator tests pass.  ",
+      });
+      expect(completed).toMatchObject({
+        ok: true,
+        goal: {
+          id: "goal_1",
+          state: "completed",
+          revision: 3,
+          finishedAt: "2026-08-22T12:00:00.000Z",
+          completionSummary: "Implemented guarded Completion.",
+          verificationEvidence: "Coordinator tests pass.",
+        },
+      });
+      expect(
+        fixture.database
+          .prepare(
+            `SELECT state, revision, finished_at AS finishedAt,
+              completion_summary AS completionSummary,
+              verification_evidence AS verificationEvidence
+            FROM goals WHERE id = ?`,
+          )
+          .get("goal_1"),
+      ).toEqual({
+        state: "completed",
+        revision: 3,
+        finishedAt: "2026-08-22T12:00:00.000Z",
+        completionSummary: "Implemented guarded Completion.",
+        verificationEvidence: "Coordinator tests pass.",
+      });
+
+      await expect(
+        fixture.runtime.run({
+          type: "complete",
+          threadId: "thr_one",
+          goalId: "goal_1",
+          expectedRevision: 3,
+          summary: "repeat",
+          verificationEvidence: "repeat",
+        }),
+      ).resolves.toMatchObject({
+        ok: false,
+        error: { code: "invalid_transition" },
+      });
+
+      await fixture.runtime.run({
+        type: "start",
+        threadId: "thr_one",
+        objective: "replacement objective",
+      });
+      await expect(
+        fixture.runtime.run({
+          type: "complete",
+          threadId: "thr_one",
+          goalId: "goal_1",
+          expectedRevision: 3,
+          summary: "stale turn",
+          verificationEvidence: "old evidence",
+        }),
+      ).resolves.toMatchObject({
+        ok: false,
+        error: { code: "invalid_transition" },
+      });
+      await expect(
+        fixture.runtime.run({ type: "status", threadId: "thr_one" }),
+      ).resolves.toMatchObject({
+        ok: true,
+        goal: { id: "goal_2", state: "active", revision: 1 },
+      });
+    } finally {
+      await fixture.close();
+    }
+  });
+
   it("guards pause, resume, and terminal cancellation transitions", async () => {
     const fixture = makeFixture();
     try {

@@ -3,6 +3,7 @@ import { Context, DateTime, Effect, Layer } from "effect";
 import {
   GOAL_HISTORY_MAX_LIMIT,
   GoalGatewayError,
+  GoalInvalidCompletion,
   GoalInvalidCursor,
   GoalInvalidHistoryQuery,
   GoalInvalidObjective,
@@ -169,6 +170,24 @@ export class GoalCoordinator extends Context.Service<
                 threadId: command.threadId,
                 goalId: command.goalId,
                 expectedRevision: command.expectedRevision,
+              }),
+            };
+          }
+
+          if (command.type === "complete") {
+            const summary = command.summary.trim();
+            const verificationEvidence = command.verificationEvidence.trim();
+            if (summary.length === 0 || verificationEvidence.length === 0) {
+              return yield* new GoalInvalidCompletion({
+                message:
+                  "Goal Completion requires a summary and verification evidence.",
+              });
+            }
+            const now = yield* clock.nowIso;
+            return {
+              goal: yield* repository.mutate({
+                command: { ...command, summary, verificationEvidence },
+                now,
               }),
             };
           }

@@ -13,6 +13,8 @@ Effect is pinned to `4.0.0-beta.107`. Before changing or reviewing Effect code, 
 
 The coordinator adapts BB's host-owned `better-sqlite3` handle. It must never open a second connection or close BB's handle.
 
+Agent Goal context uses `bb.agents.configure`, which is synchronous. Its callback performs one bounded direct SQLite read and never runs an asynchronous Effect program. For an active Goal, BB selects the provider-independent `goal_complete` tool and contributes the exact Goal ID, revision, objective, authority rules, and Completion requirements. The tool requires a summary and verification evidence, then applies one atomic revision-guarded transition.
+
 ## Use
 
 Install the checkout as a path plugin:
@@ -53,4 +55,4 @@ bb goal show goal_example
 bb goal delete goal_example --yes
 ```
 
-Thread-scoped commands accept `thr_example` after the subcommand. `show` and `delete` target an opaque Goal ID directly; deletion always requires `--yes`. Mutations use the current Goal revision as a compare-and-swap guard, so a concurrent edit or transition fails instead of overwriting newer state.
+Thread-scoped commands accept `thr_example` after the subcommand. `show` and `delete` target an opaque Goal ID directly; deletion always requires `--yes`. Mutations use the current Goal revision as a compare-and-swap guard, so a concurrent edit or transition fails instead of overwriting newer state. Completed Goals retain the agent's summary and verification evidence in `history`/`show` JSON, human-readable `show` output, and the Goal history panel.

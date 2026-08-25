@@ -8,10 +8,11 @@ import {
   GoalPersistenceError,
   GoalRecordNotFound,
   GoalStaleGuard,
+  type GoalCompletionCommand,
   type GoalDto,
+  type GoalGuardedAction,
   type GoalHistoryPage,
   type GoalMutationCommand,
-  type GoalMutationType,
 } from "./domain";
 import {
   encodeGoalHistoryCursor,
@@ -54,6 +55,8 @@ export const GOAL_MIGRATIONS = [
         last_sequence = MAX(last_sequence, excluded.last_sequence);
     CREATE INDEX IF NOT EXISTS goals_history_by_thread
       ON goal_history_order(thread_id, sequence DESC)`,
+  `ALTER TABLE goals ADD COLUMN completion_summary TEXT;
+   ALTER TABLE goals ADD COLUMN verification_evidence TEXT`,
 ] as const;
 
 export function migrateGoalDatabase(database: BetterSqlite3.Database): void {
@@ -73,7 +76,7 @@ interface StartGoalRecord {
 }
 
 export interface MutateGoalRecord {
-  readonly command: GoalMutationCommand;
+  readonly command: GoalMutationCommand | GoalCompletionCommand;
   readonly now: string;
 }
 
@@ -134,6 +137,8 @@ type GoalRow = {
   readonly createdAt: string;
   readonly updatedAt: string;
   readonly finishedAt: string | null;
+  readonly completionSummary: string | null;
+  readonly verificationEvidence: string | null;
 };
 
 type GoalHistoryRow = GoalRow & { readonly historySequence: number };
@@ -142,12 +147,13 @@ function messageFromCause(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
 }
 
-function permitsMutation(goal: GoalDto, action: GoalMutationType): boolean {
+function permitsMutation(goal: GoalDto, action: GoalGuardedAction): boolean {
   switch (action) {
     case "edit":
     case "cancel":
       return goal.finishedAt === null;
     case "pause":
+    case "complete":
       return goal.state === "active";
     case "resume":
       return goal.state === "paused";
@@ -176,22 +182,44 @@ function deleteErrorFromCause(cause: unknown): GoalDeleteError {
   });
 }
 
+const goalColumns = `SELECT
+    id,
+    thread_id AS threadId,
+    objective,
+    state,
+    revision,
+    created_at AS createdAt,
+    updated_at AS updatedAt,
+    finished_at AS finishedAt,
+    completion_summary AS completionSummary,
+    verification_evidence AS verificationEvidence
+  FROM goals`;
+
+export interface CurrentGoalSnapshotReader {
+  readonly current: (threadId: string) => GoalDto | null;
+}
+
+export function makeCurrentGoalSnapshotReader(
+  database: BetterSqlite3.Database,
+): CurrentGoalSnapshotReader {
+  const selectCurrent = database.prepare<[string], GoalRow>(`${goalColumns}
+    WHERE thread_id = ? AND finished_at IS NULL
+    ORDER BY created_at DESC
+    LIMIT 1`);
+  return {
+    current(threadId) {
+      const row = selectCurrent.get(threadId);
+      return row === undefined ? null : (decodeGoal(row) as GoalDto);
+    },
+  };
+}
+
 export function makeGoalRepositoryLayer(
   database: BetterSqlite3.Database,
 ): Layer.Layer<GoalRepository> {
   return Layer.effect(
     GoalRepository,
     Effect.sync(() => {
-      const goalColumns = `SELECT
-          id,
-          thread_id AS threadId,
-          objective,
-          state,
-          revision,
-          created_at AS createdAt,
-          updated_at AS updatedAt,
-          finished_at AS finishedAt
-        FROM goals`;
       const selectCurrent = database.prepare<[string], GoalRow>(`${goalColumns}
         WHERE thread_id = ? AND finished_at IS NULL
         ORDER BY created_at DESC
@@ -205,6 +233,8 @@ export function makeGoalRepositoryLayer(
           goals.created_at AS createdAt,
           goals.updated_at AS updatedAt,
           goals.finished_at AS finishedAt,
+          goals.completion_summary AS completionSummary,
+          goals.verification_evidence AS verificationEvidence,
           goal_history_order.sequence AS historySequence
         FROM goals
         INNER JOIN goal_history_order
@@ -268,6 +298,14 @@ export function makeGoalRepositoryLayer(
         `UPDATE goals
           SET state = 'canceled', revision = revision + 1, updated_at = ?, finished_at = ?
           WHERE id = ? AND thread_id = ? AND revision = ? AND finished_at IS NULL`,
+      );
+      const complete = database.prepare(
+        `UPDATE goals
+          SET state = 'completed', revision = revision + 1,
+            updated_at = ?, finished_at = ?, completion_summary = ?,
+            verification_evidence = ?
+          WHERE id = ? AND thread_id = ? AND revision = ?
+            AND state = 'active' AND finished_at IS NULL`,
       );
       const deleteByGuard = database.prepare(
         `DELETE FROM goals
@@ -378,6 +416,16 @@ export function makeGoalRepositoryLayer(
                 return cancel.run(
                   now,
                   now,
+                  command.goalId,
+                  command.threadId,
+                  command.expectedRevision,
+                );
+              case "complete":
+                return complete.run(
+                  now,
+                  now,
+                  command.summary,
+                  command.verificationEvidence,
                   command.goalId,
                   command.threadId,
                   command.expectedRevision,

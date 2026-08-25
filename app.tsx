@@ -37,6 +37,8 @@ interface GoalView {
   readonly createdAt: string;
   readonly updatedAt: string;
   readonly finishedAt: string | null;
+  readonly completionSummary: string | null;
+  readonly verificationEvidence: string | null;
 }
 
 type ViewState =
@@ -218,6 +220,22 @@ export function GoalHistoryPanel({ threadId }: { readonly threadId: string }) {
                     <p className="mt-2 whitespace-pre-wrap text-foreground">
                       {goal.objective}
                     </p>
+                    {goal.completionSummary !== null ? (
+                      <div className="mt-3 rounded-md bg-muted/50 p-2 text-sm">
+                        <p className="font-medium text-foreground">
+                          Completion summary
+                        </p>
+                        <p className="mt-1 whitespace-pre-wrap text-muted-foreground">
+                          {goal.completionSummary}
+                        </p>
+                        <p className="mt-2 font-medium text-foreground">
+                          Verification evidence
+                        </p>
+                        <p className="mt-1 whitespace-pre-wrap text-muted-foreground">
+                          {goal.verificationEvidence}
+                        </p>
+                      </div>
+                    ) : null}
                     <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
                       <code>{goal.id}</code>
                       <span>Revision {goal.revision}</span>
