@@ -401,6 +401,43 @@ describe("Goal BB adapter", () => {
           events: {
             list: async () => [
               {
+                id: "event-stale-rate-limit",
+                seq: 0,
+                createdAt: resetAt - 4,
+                scope: { kind: "thread" },
+                threadId: "thr_failure",
+                type: "provider/rateLimits/updated",
+                data: {
+                  rateLimits: {
+                    kind: "subscription-window",
+                    status: "blocked",
+                    providerId: "test-provider",
+                    reachedReason: "stale history",
+                    overageReason: null,
+                    overageStatus: null,
+                    windows: [],
+                  },
+                },
+              },
+              {
+                id: "event-turn-requested",
+                seq: 1,
+                createdAt: resetAt - 3,
+                scope: { kind: "thread" },
+                threadId: "thr_failure",
+                type: "client/turn/requested",
+                data: { requestId: "request_current" },
+              },
+              {
+                id: "event-turn-accepted",
+                seq: 2,
+                createdAt: resetAt - 2,
+                scope: { kind: "turn", turnId: "turn_current" },
+                threadId: "thr_failure",
+                type: "turn/input/accepted",
+                data: { clientRequestId: "request_current" },
+              },
+              {
                 id: "event-turn-completed",
                 seq: 9,
                 createdAt: resetAt,
@@ -413,7 +450,7 @@ describe("Goal BB adapter", () => {
                 id: "event-rate-limit",
                 seq: 8,
                 createdAt: resetAt - 1,
-                scope: { kind: "turn", turnId: "turn_current" },
+                scope: { kind: "thread" },
                 threadId: "thr_failure",
                 type: "provider/rateLimits/updated",
                 data: {
@@ -478,6 +515,13 @@ describe("Goal BB adapter", () => {
           usageResetAt: "2099-08-22T12:05:00.000Z",
         },
       });
+      expect(
+        database
+          .prepare(
+            "SELECT event_seq, turn_id FROM goal_failure_events WHERE event_id = ?",
+          )
+          .get("event-rate-limit"),
+      ).toEqual({ event_seq: 8, turn_id: "turn_current" });
       const cli = await harness.behavior.runCli(["status"], {
         threadId: "thr_failure",
       });

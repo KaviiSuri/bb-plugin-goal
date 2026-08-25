@@ -79,15 +79,10 @@ function validResetAt(
 
 function latestFailureEvent(
   events: readonly GoalFailureEvent[],
-  currentTurnId: string | null,
 ): GoalFailureEvent | null {
   return (
     events
-      .filter(
-        (event) =>
-          failureEventTypes.has(event.type) &&
-          (currentTurnId === null || event.turnId === currentTurnId),
-      )
+      .filter((event) => failureEventTypes.has(event.type))
       .reduce<GoalFailureEvent | null>(
         (latest, event) =>
           latest === null || event.seq > latest.seq ? event : latest,
@@ -105,9 +100,8 @@ export function classifyGoalFailureWithIdentity(
   events: readonly GoalFailureEvent[],
   nowMs: number,
   fallbackMessage: string | null = null,
-  currentTurnId: string | null = null,
 ): ClassifiedGoalFailure {
-  const event = latestFailureEvent(events, currentTurnId);
+  const event = latestFailureEvent(events);
   if (event?.type === "provider/rateLimits/updated") {
     const parsedRate = rateLimitsData.safeParse(event.data);
     if (parsedRate.success && parsedRate.data.rateLimits.status === "blocked") {
@@ -182,12 +176,6 @@ export function classifyGoalFailure(
   events: readonly GoalFailureEvent[],
   nowMs: number,
   fallbackMessage: string | null = null,
-  currentTurnId: string | null = null,
 ): GoalFailure {
-  return classifyGoalFailureWithIdentity(
-    events,
-    nowMs,
-    fallbackMessage,
-    currentTurnId,
-  ).failure;
+  return classifyGoalFailureWithIdentity(events, nowMs, fallbackMessage).failure;
 }

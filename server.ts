@@ -786,6 +786,25 @@ type ThreadFailureClassification = ClassifiedGoalFailure & {
   readonly observedEvents: ReadonlyArray<GoalFailureEventIdentity>;
 };
 
+type FailureEventScope =
+  | { readonly kind: "thread" }
+  | { readonly kind: "turn"; readonly turnId: string };
+
+type FailureCorrelationEvent = {
+  readonly id: string;
+  readonly seq: number;
+  readonly createdAt: number;
+  readonly scope: FailureEventScope;
+  readonly type: string;
+  readonly data: unknown;
+};
+
+function objectData(data: unknown): Record<string, unknown> | null {
+  return typeof data === "object" && data !== null
+    ? (data as Record<string, unknown>)
+    : null;
+}
+
 async function classifyThreadFailure(
   bb: BbPluginApi,
   threadId: string,
@@ -793,72 +812,160 @@ async function classifyThreadFailure(
   lifecycleCreatedAtMs: number,
   signal?: AbortSignal,
 ): Promise<ThreadFailureClassification> {
-  const events = await bb.sdk.threads.events.list({
+  const runEventTypes = [
+    "client/turn/requested",
+    "provider/error",
+    "provider/rateLimits/updated",
+    "system/error",
+    "turn/completed",
+    "turn/input/accepted",
+  ] as const;
+  const requestPage = await bb.sdk.threads.events.list({
     threadId,
     order: "desc",
-    limit: "50",
-    types: [
-      "provider/error",
-      "provider/rateLimits/updated",
-      "system/error",
-      "turn/started",
-      "turn/completed",
-    ],
+    limit: "1",
+    types: ["client/turn/requested"],
     signal,
   });
-  const latestTurnEvent = events
-    .filter(
-      (event) =>
-        event.scope.kind === "turn" &&
-        (event.type === "turn/started" || event.type === "turn/completed"),
-    )
-    .sort((left, right) => right.seq - left.seq)[0];
-  const currentTurnId =
-    latestTurnEvent?.scope.kind === "turn"
-      ? latestTurnEvent.scope.turnId
-      : null;
-  const structuredEvents = events
+  const requestRow = requestPage.find(
+    (event) => event.type === "client/turn/requested",
+  );
+  const events = [...requestPage];
+  if (requestRow !== undefined) {
+    let afterSeq = String(requestRow.seq);
+    while (true) {
+      const page = await bb.sdk.threads.events.list({
+        threadId,
+        afterSeq,
+        order: "asc",
+        limit: "500",
+        types: runEventTypes,
+        signal,
+      });
+      events.push(...page);
+      if (page.length < 500) break;
+      const newest = page.at(-1);
+      if (newest === undefined) break;
+      afterSeq = String(newest.seq);
+    }
+  } else {
+    events.push(
+      ...(await bb.sdk.threads.events.list({
+        threadId,
+        order: "desc",
+        limit: "500",
+        types: [
+          "provider/error",
+          "provider/rateLimits/updated",
+          "system/error",
+          "turn/completed",
+          "turn/input/accepted",
+        ],
+        signal,
+      })),
+    );
+  }
+  const rows: FailureCorrelationEvent[] = [
+    ...new Map(events.map((event) => [event.id, event])).values(),
+  ].map((event) => ({
+    id: event.id,
+    seq: event.seq,
+    createdAt: event.createdAt,
+    scope: event.scope,
+    type: event.type,
+    data: event.data,
+  }));
+  const requests = rows
+    .filter((row) => row.type === "client/turn/requested")
+    .filter((row) => typeof objectData(row.data)?.requestId === "string")
+    .sort((left, right) => left.seq - right.seq);
+  const latestRequest = requests.at(-1);
+  const acceptedByRequestId = new Map<string, FailureCorrelationEvent>();
+  const completedByTurnId = new Map<string, FailureCorrelationEvent>();
+  for (const row of rows) {
+    const data = objectData(row.data);
+    if (
+      row.type === "turn/input/accepted" &&
+      row.scope.kind === "turn" &&
+      typeof data?.clientRequestId === "string"
+    ) {
+      if (!acceptedByRequestId.has(data.clientRequestId)) {
+        acceptedByRequestId.set(data.clientRequestId, row);
+      }
+    }
+    if (
+      row.type === "turn/completed" &&
+      row.scope.kind === "turn" &&
+      data?.status === "failed"
+    ) {
+      completedByTurnId.set(row.scope.turnId, row);
+    }
+  }
+  let failedRun: {
+    readonly requestSeq: number;
+    readonly completedSeq: number;
+    readonly turnId: string;
+  } | null = null;
+  if (latestRequest !== undefined) {
+    const requestId = objectData(latestRequest.data)?.requestId;
+    if (typeof requestId === "string") {
+      const accepted = acceptedByRequestId.get(requestId);
+      if (
+        accepted !== undefined &&
+        accepted.seq > latestRequest.seq &&
+        accepted.scope.kind === "turn"
+      ) {
+        const turnId = accepted.scope.turnId;
+        const completed = completedByTurnId.get(turnId);
+        if (completed !== undefined && completed.seq > accepted.seq) {
+          failedRun = {
+            requestSeq: latestRequest.seq,
+            completedSeq: completed.seq,
+            turnId,
+          };
+        }
+      }
+    }
+  }
+  const structuredEvents = rows
     .filter((event) =>
       ["provider/error", "provider/rateLimits/updated", "system/error"].includes(
         event.type,
       ),
     )
+    .filter(
+      (event) =>
+        failedRun !== null &&
+        event.seq >= failedRun.requestSeq &&
+        event.seq <= failedRun.completedSeq,
+    )
     .map((event) => ({
       id: event.id,
       seq: event.seq,
       createdAt: event.createdAt,
-      turnId: event.scope.kind === "turn" ? event.scope.turnId : null,
+      turnId:
+        failedRun?.turnId ??
+        (event.scope.kind === "turn" ? event.scope.turnId : null),
       type: event.type,
       data: event.data,
     }));
   const lifecycleEvent: GoalFailureEventIdentity = {
-    id: `thread.failed:${threadId}:${currentTurnId ?? lifecycleCreatedAtMs}`,
+    id: `thread.failed:${threadId}:${failedRun?.completedSeq ?? lifecycleCreatedAtMs}`,
     seq: null,
     createdAt: lifecycleCreatedAtMs,
-    turnId: currentTurnId,
+    turnId: failedRun?.turnId ?? null,
   };
-  const correlatedStructuredEvents =
-    currentTurnId === null && fallbackMessage !== null
-      ? []
-      : structuredEvents;
   const classified = classifyGoalFailureWithIdentity(
-    correlatedStructuredEvents,
+    structuredEvents,
     Date.now(),
     fallbackMessage,
-    currentTurnId,
   );
   return {
     ...classified,
     event: classified.event ?? lifecycleEvent,
-    observedEvents: [
-      ...structuredEvents.map(({ id, seq, createdAt, turnId }) => ({
-        id,
-        seq,
-        createdAt,
-        turnId,
-      })),
-      lifecycleEvent,
-    ],
+    observedEvents: [...structuredEvents, lifecycleEvent].map(
+      ({ id, seq, createdAt, turnId }) => ({ id, seq, createdAt, turnId }),
+    ),
   };
 }
 
