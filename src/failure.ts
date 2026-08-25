@@ -100,11 +100,18 @@ function blockedRateLimits(
     return null;
   }
   const rate = parsedRate.data.rateLimits;
-  const resetAt = (rate.windows ?? [])
-    .map((window) =>
-      window.status === "blocked" ? validResetAt(window.resetsAtMs, nowMs) : null,
-    )
-    .find((candidate): candidate is string => candidate !== null) ?? null;
+  const blockedWindows = (rate.windows ?? []).filter(
+    (window) => window.status === "blocked",
+  );
+  const resetTimes = blockedWindows.map((window) => window.resetsAtMs);
+  const hasUntrustworthyReset = resetTimes.some((resetTime) => resetTime === null);
+  const trustworthyResetTimes = resetTimes.filter(
+    (resetTime): resetTime is number => resetTime !== null,
+  );
+  const resetAt =
+    blockedWindows.length === 0 || hasUntrustworthyReset
+      ? null
+      : validResetAt(Math.max(...trustworthyResetTimes), nowMs);
   return {
     kind: rate.kind,
     reason: rate.reachedReason ?? "Provider usage limit reached.",

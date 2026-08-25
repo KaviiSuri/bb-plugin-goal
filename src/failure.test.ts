@@ -22,7 +22,13 @@ describe("structured Goal failure classification", () => {
                 windows: [
                   {
                     status: "blocked",
+                    label: "session",
                     resetsAtMs: Date.parse("2026-08-22T12:05:00.000Z"),
+                  },
+                  {
+                    status: "blocked",
+                    label: "weekly",
+                    resetsAtMs: Date.parse("2026-08-22T13:05:00.000Z"),
                   },
                 ],
               },
@@ -46,7 +52,52 @@ describe("structured Goal failure classification", () => {
       kind: "usage-limit",
       limitKind: "subscription-window",
       reason: "subscription window exhausted",
-      resetAt: "2026-08-22T12:05:00.000Z",
+      resetAt: "2026-08-22T13:05:00.000Z",
+    });
+  });
+
+  it("does not schedule recovery when a blocked window has no trustworthy reset", () => {
+    expect(
+      classifyGoalFailure(
+        [
+          {
+            id: "event-rate-untrustworthy",
+            seq: 2,
+            createdAt: Date.parse("2026-08-22T12:01:00.000Z"),
+            type: "provider/rateLimits/updated",
+            data: {
+              rateLimits: {
+                kind: "subscription-window",
+                status: "blocked",
+                reachedReason: "multiple windows blocked",
+                windows: [
+                  {
+                    status: "blocked",
+                    resetsAtMs: Date.parse("2026-08-22T12:05:00.000Z"),
+                  },
+                  { status: "blocked", resetsAtMs: null },
+                ],
+              },
+            },
+          },
+          {
+            id: "event-terminal-untrustworthy-rate-error",
+            seq: 3,
+            createdAt: Date.parse("2026-08-22T12:01:01.000Z"),
+            type: "provider/error",
+            data: {
+              message: "terminal provider rate limit",
+              errorInfo: { category: "rate-limit", providerCode: null },
+            },
+          },
+        ],
+        Date.parse("2026-08-22T12:00:00.000Z"),
+      ),
+    ).toEqual({
+      kind: "usage-limit",
+      limitKind: "subscription-window",
+      reason: "multiple windows blocked",
+      resetAt: null,
     });
   });
 
