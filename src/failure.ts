@@ -79,10 +79,15 @@ function validResetAt(
 
 function latestFailureEvent(
   events: readonly GoalFailureEvent[],
+  currentTurnId: string | null,
 ): GoalFailureEvent | null {
   return (
     events
-      .filter((event) => failureEventTypes.has(event.type))
+      .filter(
+        (event) =>
+          failureEventTypes.has(event.type) &&
+          (currentTurnId === null || event.turnId === currentTurnId),
+      )
       .reduce<GoalFailureEvent | null>(
         (latest, event) =>
           latest === null || event.seq > latest.seq ? event : latest,
@@ -92,24 +97,17 @@ function latestFailureEvent(
 }
 
 /**
- * Classify the newest structured failure event by its durable sequence. The
- * event kind is deliberately not a priority: an older rate-limit event must
- * not override a newer ordinary provider error.
+ * Classify the newest structured failure event by its authoritative turn
+ * scope and durable sequence. The event kind is deliberately not a priority:
+ * an older rate-limit event must not override a newer ordinary provider error.
  */
 export function classifyGoalFailureWithIdentity(
   events: readonly GoalFailureEvent[],
   nowMs: number,
   fallbackMessage: string | null = null,
-  lifecycleCreatedAtMs: number | null = null,
+  currentTurnId: string | null = null,
 ): ClassifiedGoalFailure {
-  const structuredEvent = latestFailureEvent(events);
-  const event =
-    fallbackMessage !== null &&
-    lifecycleCreatedAtMs !== null &&
-    structuredEvent !== null &&
-    structuredEvent.createdAt < lifecycleCreatedAtMs
-      ? null
-      : structuredEvent;
+  const event = latestFailureEvent(events, currentTurnId);
   if (event?.type === "provider/rateLimits/updated") {
     const parsedRate = rateLimitsData.safeParse(event.data);
     if (parsedRate.success && parsedRate.data.rateLimits.status === "blocked") {
@@ -184,6 +182,12 @@ export function classifyGoalFailure(
   events: readonly GoalFailureEvent[],
   nowMs: number,
   fallbackMessage: string | null = null,
+  currentTurnId: string | null = null,
 ): GoalFailure {
-  return classifyGoalFailureWithIdentity(events, nowMs, fallbackMessage).failure;
+  return classifyGoalFailureWithIdentity(
+    events,
+    nowMs,
+    fallbackMessage,
+    currentTurnId,
+  ).failure;
 }

@@ -106,6 +106,7 @@ export const GOAL_MIGRATIONS = [
   );
   CREATE INDEX IF NOT EXISTS goal_failure_events_by_sequence
     ON goal_failure_events(thread_id, event_seq DESC)`,
+  `ALTER TABLE goal_failure_events ADD COLUMN turn_id TEXT`,
 ] as const;
 
 export function migrateGoalDatabase(database: BetterSqlite3.Database): void {
@@ -527,8 +528,8 @@ export function makeGoalRepositoryLayer(
       );
       const insertFailureEvent = database.prepare(
         `INSERT OR IGNORE INTO goal_failure_events (
-          thread_id, event_id, event_seq, event_created_at, observed_at
-        ) VALUES (?, ?, ?, ?, ?)`,
+          thread_id, event_id, event_seq, event_created_at, turn_id, observed_at
+        ) VALUES (?, ?, ?, ?, ?, ?)`,
       );
       const selectMaxFailureEventSeq = database.prepare<
         [string],
@@ -536,6 +537,14 @@ export function makeGoalRepositoryLayer(
       >(
         `SELECT MAX(event_seq) AS eventSeq FROM goal_failure_events
           WHERE thread_id = ?`,
+      );
+      const selectFailureEventForTurn = database.prepare<
+        [string, string],
+        { readonly eventId: string }
+      >(
+        `SELECT event_id AS eventId FROM goal_failure_events
+          WHERE thread_id = ? AND turn_id = ?
+          LIMIT 1`,
       );
       const recoverUsageLimit = database.prepare(
         `UPDATE goals
@@ -905,7 +914,15 @@ export function makeGoalRepositoryLayer(
             ...(record.observedEvents ?? []),
             ...(record.event === undefined ? [] : [record.event]),
           ];
-          let selectedEventWasNew = record.event === undefined;
+          const priorTurnEvent =
+            record.event?.turnId === undefined || record.event.turnId === null
+              ? undefined
+              : selectFailureEventForTurn.get(
+                  record.threadId,
+                  record.event.turnId,
+                );
+          let selectedEventWasNew =
+            record.event === undefined && priorTurnEvent === undefined;
           const observedEventIds = new Set<string>();
           for (const event of observedEvents) {
             if (observedEventIds.has(event.id)) continue;
@@ -915,10 +932,12 @@ export function makeGoalRepositoryLayer(
               event.id,
               event.seq,
               event.createdAt,
+              event.turnId ?? null,
               record.now,
             );
             if (record.event?.id === event.id) {
-              selectedEventWasNew = inserted.changes === 1;
+              selectedEventWasNew =
+                inserted.changes === 1 && priorTurnEvent === undefined;
             }
           }
 

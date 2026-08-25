@@ -382,7 +382,7 @@ describe("Goal BB adapter", () => {
     }
   });
 
-  it("pauses a failed Goal from structured provider rate-limit events", async () => {
+  it("correlates an SDK-shaped structured failure by turn scope before thread.updatedAt", async () => {
     const resetAt = Date.parse("2099-08-22T12:05:00.000Z");
     const { bb, harness } = createFakePluginHost({
       pluginId: "goal",
@@ -392,6 +392,7 @@ describe("Goal BB adapter", () => {
             makeThreadResponse({
               id: threadId,
               status: "error",
+              updatedAt: resetAt + 1_000,
               environmentId: "env_test",
             }),
           queuedMessages: { list: async () => [] },
@@ -400,10 +401,19 @@ describe("Goal BB adapter", () => {
           events: {
             list: async () => [
               {
+                id: "event-turn-completed",
+                seq: 9,
+                createdAt: resetAt,
+                scope: { kind: "turn", turnId: "turn_current" },
+                threadId: "thr_failure",
+                type: "turn/completed",
+                data: { status: "failed" },
+              },
+              {
                 id: "event-rate-limit",
                 seq: 8,
                 createdAt: resetAt - 1,
-                scope: { kind: "thread" },
+                scope: { kind: "turn", turnId: "turn_current" },
                 threadId: "thr_failure",
                 type: "provider/rateLimits/updated",
                 data: {
@@ -443,6 +453,7 @@ describe("Goal BB adapter", () => {
           thread: makeThreadResponse({
             id: "thr_failure",
             status: "error",
+            updatedAt: resetAt + 1_000,
             environmentId: "env_test",
           }),
           error: "assistant prose must not classify usage limits",

@@ -90,6 +90,7 @@ export interface GoalFailureEventIdentity {
   readonly id: string;
   readonly seq: number | null;
   readonly createdAt: number;
+  readonly turnId?: string | null;
 }
 
 export type GoalFailure =

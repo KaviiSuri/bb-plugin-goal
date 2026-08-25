@@ -797,35 +797,65 @@ async function classifyThreadFailure(
     threadId,
     order: "desc",
     limit: "50",
-    types: ["provider/error", "provider/rateLimits/updated", "system/error"],
+    types: [
+      "provider/error",
+      "provider/rateLimits/updated",
+      "system/error",
+      "turn/started",
+      "turn/completed",
+    ],
     signal,
   });
-  const structuredEvents = events.map((event) => ({
-    id: event.id,
-    seq: event.seq,
-    createdAt: event.createdAt,
-    type: event.type,
-    data: event.data,
-  }));
+  const latestTurnEvent = events
+    .filter(
+      (event) =>
+        event.scope.kind === "turn" &&
+        (event.type === "turn/started" || event.type === "turn/completed"),
+    )
+    .sort((left, right) => right.seq - left.seq)[0];
+  const currentTurnId =
+    latestTurnEvent?.scope.kind === "turn"
+      ? latestTurnEvent.scope.turnId
+      : null;
+  const structuredEvents = events
+    .filter((event) =>
+      ["provider/error", "provider/rateLimits/updated", "system/error"].includes(
+        event.type,
+      ),
+    )
+    .map((event) => ({
+      id: event.id,
+      seq: event.seq,
+      createdAt: event.createdAt,
+      turnId: event.scope.kind === "turn" ? event.scope.turnId : null,
+      type: event.type,
+      data: event.data,
+    }));
   const lifecycleEvent: GoalFailureEventIdentity = {
-    id: `thread.failed:${threadId}:${lifecycleCreatedAtMs}`,
+    id: `thread.failed:${threadId}:${currentTurnId ?? lifecycleCreatedAtMs}`,
     seq: null,
     createdAt: lifecycleCreatedAtMs,
+    turnId: currentTurnId,
   };
+  const correlatedStructuredEvents =
+    currentTurnId === null && fallbackMessage !== null
+      ? []
+      : structuredEvents;
   const classified = classifyGoalFailureWithIdentity(
-    structuredEvents,
+    correlatedStructuredEvents,
     Date.now(),
     fallbackMessage,
-    lifecycleCreatedAtMs,
+    currentTurnId,
   );
   return {
     ...classified,
     event: classified.event ?? lifecycleEvent,
     observedEvents: [
-      ...structuredEvents.map(({ id, seq, createdAt }) => ({
+      ...structuredEvents.map(({ id, seq, createdAt, turnId }) => ({
         id,
         seq,
         createdAt,
+        turnId,
       })),
       lifecycleEvent,
     ],

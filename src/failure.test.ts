@@ -86,6 +86,7 @@ describe("structured Goal failure classification", () => {
             id: "stale-rate-limit",
             seq: 20,
             createdAt: Date.parse("2026-08-22T12:00:00.000Z"),
+            turnId: "turn_old",
             type: "provider/rateLimits/updated",
             data: {
               rateLimits: {
@@ -99,7 +100,7 @@ describe("structured Goal failure classification", () => {
         ],
         Date.parse("2026-08-22T12:01:00.000Z"),
         "current fallback failure",
-        Date.parse("2026-08-22T12:01:00.000Z"),
+        "turn_current",
       ),
     ).toEqual({
       event: null,
