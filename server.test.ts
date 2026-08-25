@@ -178,6 +178,147 @@ describe("Goal BB adapter", () => {
     }
   });
 
+  it("reconciles real delivery markers across fake-host reloads", async () => {
+    let sends = 0;
+    const timelineRows: Array<{ kind: "conversation"; text: string }> = [];
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "goal",
+      sdk: {
+        threads: {
+          get: async ({ threadId }) =>
+            makeThreadResponse({
+              id: threadId,
+              status: "idle",
+              updatedAt: 42,
+              environmentId: "env_test",
+            }),
+          send: async ({ input }) => {
+            sends += 1;
+            const text = input.find((part) => part.type === "text");
+            if (text?.type === "text") {
+              timelineRows.push({ kind: "conversation", text: text.text });
+            }
+            return { ok: true };
+          },
+          timeline: async () => ({ rows: timelineRows }),
+        },
+      },
+    });
+    await deterministicPlugin()(bb);
+    const service = harness.behavior.runService("continuations");
+    try {
+      const started = (await harness.behavior.callRpc("start", {
+        threadId: "thr_reload",
+        objective: "reconcile automatic delivery",
+      })) as { goal: GoalDto };
+      await harness.behavior.emitThreadEvent("thread.idle", {
+        thread: makeThreadResponse({
+          id: "thr_reload",
+          status: "idle",
+          updatedAt: 42,
+          environmentId: "env_test",
+        }),
+        lastAssistantText: null,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(sends).toBe(1);
+      expect(harness.inspection.sdk.callsTo("threads.send")[0]?.[0]).toMatchObject({
+        input: [{ visibility: "agent-only" }],
+      });
+      const marker = timelineRows[0]?.text.match(
+        /Internal delivery marker: (bb-goal-continuation:[^ ]+)/,
+      )?.[1];
+      expect(marker).toMatch(/^bb-goal-continuation:/);
+      expect(timelineRows[0]?.text).toContain(
+        "Internal delivery marker:",
+      );
+
+      const database = bb.storage.database();
+      database
+        .prepare(
+          `UPDATE goal_continuations
+           SET state = 'sending', outcome = NULL, outcome_reason = NULL
+           WHERE opportunity_key = ?`,
+        )
+        .run("idle:42");
+
+      const reloaded = await harness.lifecycle.reload(deterministicPlugin());
+      const reloadedService = reloaded.harness.behavior.runService(
+        "continuations",
+      );
+      try {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        expect(sends).toBe(1);
+        expect(
+          reloaded.bb
+            .storage.database()
+            .prepare(
+              "SELECT state, outcome, outcome_reason FROM goal_continuations WHERE opportunity_key = ?",
+            )
+            .get("idle:42"),
+        ).toMatchObject({
+          state: "resolved",
+          outcome: "sent",
+          outcome_reason: "Delivery marker reconciled after restart",
+        });
+
+        reloaded.bb.storage
+          .database()
+          .prepare(
+            `INSERT INTO goal_continuations (
+              id, thread_id, goal_id, goal_revision, opportunity_key,
+              delivery_marker, attempt, state, outcome, lease_expires_at,
+              outcome_reason, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 1, 'sending', NULL, NULL, NULL, ?, ?)`,
+          )
+          .run(
+            "continuation_lost",
+            "thr_reload",
+            started.goal.id,
+            started.goal.revision,
+            "idle:lost",
+            "bb-goal-continuation:lost",
+            "2026-08-22T12:00:00.000Z",
+            "2026-08-22T12:00:00.000Z",
+          );
+      } finally {
+        reloadedService.controller.abort();
+        await reloadedService.done;
+      }
+
+      const recovered = await reloaded.harness.lifecycle.reload(
+        deterministicPlugin(),
+      );
+      const recoveredService = recovered.harness.behavior.runService(
+        "continuations",
+      );
+      try {
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        expect(sends).toBe(2);
+        const sentMarker = timelineRows.at(-1);
+        expect(sentMarker?.text).toContain(
+          "Internal delivery marker: bb-goal-continuation:lost",
+        );
+        expect(
+          recovered.bb
+            .storage.database()
+            .prepare(
+              "SELECT state, outcome, outcome_reason FROM goal_continuations WHERE opportunity_key = ?",
+            )
+            .get("idle:lost"),
+        ).toMatchObject({ state: "resolved", outcome: "sent" });
+      } finally {
+        recoveredService.controller.abort();
+        await recoveredService.done;
+        await recovered.harness.lifecycle.dispose();
+      }
+    } finally {
+      service.controller.abort();
+      await service.done;
+      await harness.lifecycle.dispose();
+    }
+  });
+
   it("contributes the same bounded active Goal context to every provider without running Effect", async () => {
     let runtimeRuns = 0;
     const observedPlugin = createPlugin({

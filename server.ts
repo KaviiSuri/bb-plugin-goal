@@ -780,7 +780,7 @@ export function createPlugin(
         const thread = await bb.sdk.threads.get({ threadId, signal });
         return { status: thread.status };
       },
-      async sendContinuation(threadId, signal) {
+      async sendContinuation(threadId, deliveryMarker, signal) {
         if (signal?.aborted === true) {
           throw new Error("Goal plugin is shutting down.");
         }
@@ -791,11 +791,24 @@ export function createPlugin(
             {
               type: "text",
               text:
-                "Continue working toward the active BB Goal. Re-read the objective and make the next meaningful step. Do not stop unless the Goal is complete or genuinely blocked.",
+                "Continue working toward the active BB Goal. Re-read the objective and make the next meaningful step. Do not stop unless the Goal is complete or genuinely blocked. " +
+                `Internal delivery marker: ${deliveryMarker}`,
               mentions: [],
+              visibility: "agent-only",
             },
           ],
         });
+      },
+      async reconcileContinuation(threadId, deliveryMarker, signal) {
+        const timeline = await bb.sdk.threads.timeline({
+          threadId,
+          signal,
+          segmentLimit: "100",
+          summaryOnly: "false",
+        });
+        return timeline.rows.some(
+          (row) => "text" in row && row.text.includes(deliveryMarker),
+        );
       },
     });
 
@@ -827,12 +840,21 @@ export function createPlugin(
 
     bb.background.service("continuations", {
       async start(signal) {
-        await runtime.recoverContinuations();
         while (!signal.aborted) {
-          let claimed = false;
-          do {
-            claimed = await runtime.processContinuation(signal);
-          } while (claimed && !signal.aborted);
+          try {
+            await runtime.recoverContinuations();
+            let claimed = false;
+            do {
+              claimed = await runtime.processContinuation(signal);
+            } while (claimed && !signal.aborted);
+          } catch (cause) {
+            if (signal.aborted) break;
+            bb.log.error(
+              `Continuation worker recovered from an error: ${
+                cause instanceof Error ? cause.message : String(cause)
+              }`,
+            );
+          }
           if (!signal.aborted) await waitForWork(signal);
         }
       },

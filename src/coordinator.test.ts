@@ -1115,15 +1115,26 @@ describe("Goal coordinator", () => {
         .run("idle-after-send");
       await reloaded.recoverContinuations();
       expect(
+        fixture.database
+          .prepare(
+            "SELECT state, outcome, outcome_reason FROM goal_continuations WHERE opportunity_key = ?",
+          )
+          .get("idle-after-send"),
+      ).toMatchObject({
+        state: "pending",
+        outcome: "expired",
+        outcome_reason: "Delivery marker absent after restart",
+      });
+      expect(
         await reloaded.processContinuation(new AbortController().signal),
-      ).toBe(false);
+      ).toBe(true);
       expect(
         fixture.database
           .prepare(
-            "SELECT state, outcome FROM goal_continuations WHERE opportunity_key = ?",
+            "SELECT state, outcome, outcome_reason FROM goal_continuations WHERE opportunity_key = ?",
           )
           .get("idle-after-send"),
-      ).toEqual({ state: "resolved", outcome: "sent" });
+      ).toMatchObject({ state: "resolved", outcome: "sent" });
       await reloaded.dispose();
 
       const stale = makeGoalRuntime(

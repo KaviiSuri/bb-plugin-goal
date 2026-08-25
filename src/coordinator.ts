@@ -32,8 +32,18 @@ export interface GoalThreadGatewayAdapter {
   ) => Promise<GoalThreadSnapshot>;
   readonly sendContinuation?: (
     threadId: string,
+    deliveryMarker: string,
     signal?: AbortSignal,
   ) => Promise<void>;
+  readonly reconcileContinuation?: (
+    threadId: string,
+    deliveryMarker: string,
+    signal?: AbortSignal,
+  ) => Promise<boolean>;
+}
+
+export function goalContinuationMarker(continuationId: string): string {
+  return `bb-goal-continuation:${continuationId}`;
 }
 
 function isRecoverableBlocker(externalAction: string): boolean {
@@ -52,8 +62,14 @@ interface GoalThreadGatewayService {
   ) => Effect.Effect<GoalThreadSnapshot, GoalGatewayError>;
   readonly sendContinuation: (
     threadId: string,
+    deliveryMarker: string,
     signal?: AbortSignal,
   ) => Effect.Effect<void, GoalGatewayError>;
+  readonly reconcileContinuation: (
+    threadId: string,
+    deliveryMarker: string,
+    signal?: AbortSignal,
+  ) => Effect.Effect<boolean, GoalGatewayError>;
 }
 
 export class GoalThreadGateway extends Context.Service<
@@ -96,17 +112,41 @@ export function makeGoalThreadGatewayLayer(
         },
       ),
       sendContinuation: Effect.fn("GoalThreadGateway.sendContinuation")(
-        function* (threadId: string, signal?: AbortSignal) {
+        function* (
+          threadId: string,
+          deliveryMarker: string,
+          signal?: AbortSignal,
+        ) {
           if (adapter.sendContinuation === undefined) {
             return yield* new GoalGatewayError({
               message: "The BB thread gateway cannot send a Continuation.",
             });
           }
           return yield* Effect.tryPromise({
-            try: () => adapter.sendContinuation!(threadId, signal),
+            try: () =>
+              adapter.sendContinuation!(threadId, deliveryMarker, signal),
             catch: (cause) =>
               new GoalGatewayError({
                 message: `Could not send a Continuation for thread ${threadId}: ${cause instanceof Error ? cause.message : String(cause)}`,
+              }),
+          });
+        },
+      ),
+      reconcileContinuation: Effect.fn(
+        "GoalThreadGateway.reconcileContinuation",
+      )(
+        function* (
+          threadId: string,
+          deliveryMarker: string,
+          signal?: AbortSignal,
+        ) {
+          if (adapter.reconcileContinuation === undefined) return false;
+          return yield* Effect.tryPromise({
+            try: () =>
+              adapter.reconcileContinuation!(threadId, deliveryMarker, signal),
+            catch: (cause) =>
+              new GoalGatewayError({
+                message: `Could not reconcile Continuation for thread ${threadId}: ${cause instanceof Error ? cause.message : String(cause)}`,
               }),
           });
         },
@@ -356,12 +396,14 @@ export class GoalContinuationCoordinator extends Context.Service<
           const current = yield* repository.current(request.threadId);
           if (current === null || current.state !== "active") return null;
           const now = yield* clock.nowIso;
+          const id = yield* ids.next;
           return yield* repository.enqueueContinuation({
-            id: yield* ids.next,
+            id,
             threadId: request.threadId,
             goalId: current.id,
             goalRevision: current.revision,
             opportunityKey: request.opportunityKey,
+            deliveryMarker: goalContinuationMarker(id),
             now,
           });
         },
@@ -369,7 +411,33 @@ export class GoalContinuationCoordinator extends Context.Service<
 
       const recover = Effect.fn("GoalContinuationCoordinator.recover")(
         function* () {
-          yield* repository.recoverContinuations(yield* clock.nowIso);
+          const now = yield* clock.nowIso;
+          yield* repository.recoverContinuations(now);
+          const sending = yield* repository.sendingContinuations();
+          for (const continuation of sending) {
+            const deliveryMarker =
+              continuation.deliveryMarker ??
+              goalContinuationMarker(continuation.id);
+            const delivered = yield* gateway.reconcileContinuation(
+              continuation.threadId,
+              deliveryMarker,
+            );
+            if (delivered) {
+              yield* repository.resolveContinuation({
+                id: continuation.id,
+                now,
+                outcome: "sent",
+                reason: "Delivery marker reconciled after restart",
+              });
+            } else {
+              yield* repository.requeueContinuation({
+                id: continuation.id,
+                deliveryMarker,
+                now,
+                reason: "Delivery marker absent after restart",
+              });
+            }
+          }
         },
       );
 
@@ -404,15 +472,23 @@ export class GoalContinuationCoordinator extends Context.Service<
             return { kind: "released" as const, continuation };
           }
 
+          const deliveryMarker =
+            continuation.deliveryMarker ??
+            goalContinuationMarker(continuation.id);
           const markedSending = yield* repository.markContinuationSending({
             id: continuation.id,
+            deliveryMarker,
             now: lease.now,
             leaseExpiresAt: lease.leaseExpiresAt,
           });
           if (!markedSending) return { kind: "released" as const, continuation };
 
           try {
-            yield* gateway.sendContinuation(continuation.threadId, signal);
+            yield* gateway.sendContinuation(
+              continuation.threadId,
+              deliveryMarker,
+              signal,
+            );
           } catch (cause) {
             yield* repository.resolveContinuation({
               id: continuation.id,

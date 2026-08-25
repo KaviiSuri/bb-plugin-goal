@@ -89,6 +89,7 @@ export const GOAL_MIGRATIONS = [
   );
   CREATE INDEX IF NOT EXISTS goal_continuations_pending
     ON goal_continuations(state, lease_expires_at, created_at)`,
+  `ALTER TABLE goal_continuations ADD COLUMN delivery_marker TEXT`,
 ] as const;
 
 export function migrateGoalDatabase(database: BetterSqlite3.Database): void {
@@ -149,6 +150,7 @@ export interface GoalContinuationRecord {
   readonly goalId: string;
   readonly goalRevision: number;
   readonly opportunityKey: string;
+  readonly deliveryMarker: string | null;
   readonly attempt: number;
   readonly state: GoalContinuationState;
   readonly outcome: GoalContinuationOutcome | null;
@@ -164,6 +166,7 @@ export interface EnqueueGoalContinuationRecord {
   readonly goalId: string;
   readonly goalRevision: number;
   readonly opportunityKey: string;
+  readonly deliveryMarker: string;
   readonly now: string;
 }
 
@@ -174,8 +177,16 @@ export interface ClaimGoalContinuationRecord {
 
 export interface MarkGoalContinuationSendingRecord {
   readonly id: string;
+  readonly deliveryMarker: string;
   readonly now: string;
   readonly leaseExpiresAt: string;
+}
+
+export interface RequeueGoalContinuationRecord {
+  readonly id: string;
+  readonly deliveryMarker: string;
+  readonly now: string;
+  readonly reason: string;
 }
 
 export interface ResolveGoalContinuationRecord {
@@ -210,6 +221,13 @@ interface GoalRepositoryService {
   readonly recoverContinuations: (
     now: string,
   ) => Effect.Effect<void, GoalPersistenceError>;
+  readonly sendingContinuations: () => Effect.Effect<
+    readonly GoalContinuationRecord[],
+    GoalPersistenceError
+  >;
+  readonly requeueContinuation: (
+    record: RequeueGoalContinuationRecord,
+  ) => Effect.Effect<boolean, GoalPersistenceError>;
   readonly claimContinuation: (
     record: ClaimGoalContinuationRecord,
   ) => Effect.Effect<GoalContinuationRecord | null, GoalPersistenceError>;
@@ -258,6 +276,7 @@ type GoalContinuationRow = {
   readonly goalId: string;
   readonly goalRevision: number;
   readonly opportunityKey: string;
+  readonly deliveryMarker: string | null;
   readonly attempt: number;
   readonly state: GoalContinuationState;
   readonly outcome: GoalContinuationOutcome | null;
@@ -491,6 +510,7 @@ export function makeGoalRepositoryLayer(
           goal_id AS goalId,
           goal_revision AS goalRevision,
           opportunity_key AS opportunityKey,
+          delivery_marker AS deliveryMarker,
           attempt,
           state,
           outcome,
@@ -502,9 +522,9 @@ export function makeGoalRepositoryLayer(
       const insertContinuation = database.prepare(`
         INSERT INTO goal_continuations (
           id, thread_id, goal_id, goal_revision, opportunity_key,
-          attempt, state, outcome, lease_expires_at, outcome_reason,
-          created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, 0, 'pending', NULL, NULL, NULL, ?, ?)
+          delivery_marker, attempt, state, outcome, lease_expires_at,
+          outcome_reason, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, 0, 'pending', NULL, NULL, NULL, ?, ?)
         ON CONFLICT DO NOTHING
       `);
       const selectContinuationById = database.prepare<[string], GoalContinuationRow>(
@@ -523,11 +543,10 @@ export function makeGoalRepositoryLayer(
         WHERE state = 'claimed' AND lease_expires_at IS NOT NULL
           AND lease_expires_at <= ?
       `);
-      const recoverSendingContinuations = database.prepare<[string]>(`
-        UPDATE goal_continuations
-        SET state = 'resolved', outcome = 'sent', lease_expires_at = NULL,
-            outcome_reason = 'send outcome recovered after restart', updated_at = ?
-        WHERE state = 'sending'
+      const selectSendingContinuations = database.prepare<[], GoalContinuationRow>(`
+        ${continuationColumns}
+          WHERE state = 'sending'
+          ORDER BY updated_at, id
       `);
       const recoverClaimedContinuations = database.prepare<[string]>(`
         UPDATE goal_continuations
@@ -541,10 +560,17 @@ export function makeGoalRepositoryLayer(
             lease_expires_at = ?, updated_at = ?
         WHERE id = ? AND state = 'pending'
       `);
-      const markContinuationSending = database.prepare<[string, string, string]>(`
+      const markContinuationSending = database.prepare<[string, string, string, string]>(`
         UPDATE goal_continuations
-        SET state = 'sending', lease_expires_at = ?, updated_at = ?
+        SET state = 'sending', delivery_marker = ?, lease_expires_at = ?,
+            updated_at = ?
         WHERE id = ? AND state = 'claimed'
+      `);
+      const requeueContinuation = database.prepare<[string, string, string, string]>(`
+        UPDATE goal_continuations
+        SET state = 'pending', delivery_marker = ?, outcome = 'expired',
+            lease_expires_at = NULL, outcome_reason = ?, updated_at = ?
+        WHERE id = ? AND state = 'sending'
       `);
       const resolveContinuation = database.prepare<[string, string, string, string]>(`
         UPDATE goal_continuations
@@ -913,6 +939,7 @@ export function makeGoalRepositoryLayer(
                 record.goalId,
                 record.goalRevision,
                 record.opportunityKey,
+                record.deliveryMarker,
                 record.now,
                 record.now,
               );
@@ -941,7 +968,6 @@ export function makeGoalRepositoryLayer(
           Effect.try({
             try: () => {
               const recover = database.transaction(() => {
-                recoverSendingContinuations.run(now);
                 recoverClaimedContinuations.run(now);
               });
               recover();
@@ -951,6 +977,37 @@ export function makeGoalRepositoryLayer(
                 message: `Could not recover Continuations: ${messageFromCause(cause)}`,
               }),
           }),
+      );
+
+      const sendingContinuations = Effect.fn(
+        "GoalRepository.sendingContinuations",
+      )(() =>
+        Effect.try({
+          try: () =>
+            selectSendingContinuations.all().map(decodeContinuation),
+          catch: (cause) =>
+            new GoalPersistenceError({
+              message: `Could not list sending Continuations: ${messageFromCause(cause)}`,
+            }),
+        }),
+      );
+
+      const requeueContinuationClaim = Effect.fn(
+        "GoalRepository.requeueContinuation",
+      )((record: RequeueGoalContinuationRecord) =>
+        Effect.try({
+          try: () =>
+            requeueContinuation.run(
+              record.deliveryMarker,
+              record.reason,
+              record.now,
+              record.id,
+            ).changes === 1,
+          catch: (cause) =>
+            new GoalPersistenceError({
+              message: `Could not requeue Continuation: ${messageFromCause(cause)}`,
+            }),
+        }),
       );
 
       const claimNextContinuation = Effect.fn("GoalRepository.claimContinuation")(
@@ -985,6 +1042,7 @@ export function makeGoalRepositoryLayer(
         Effect.try({
           try: () =>
             markContinuationSending.run(
+              record.deliveryMarker,
               record.leaseExpiresAt,
               record.now,
               record.id,
@@ -1022,6 +1080,8 @@ export function makeGoalRepositoryLayer(
         delete: deleteGoal,
         enqueueContinuation,
         recoverContinuations,
+        sendingContinuations,
+        requeueContinuation: requeueContinuationClaim,
         claimContinuation: claimNextContinuation,
         markContinuationSending: markContinuationSendingClaim,
         resolveContinuation: resolveContinuationClaim,
