@@ -591,7 +591,7 @@ describe("Goal coordinator", () => {
     }
   });
 
-  it("allows edit and cancel but not pause or resume while waiting", async () => {
+  it("allows edit, manual resume, and cancel while waiting", async () => {
     const fixture = makeFixture();
     try {
       await fixture.runtime.run({
@@ -615,28 +615,36 @@ describe("Goal coordinator", () => {
         goal: { state: "waiting", revision: 2 },
       });
 
-      for (const type of ["pause", "resume"] as const) {
-        const rejected = await fixture.runtime.run({
-          type,
-          threadId: "thr_one",
-          goalId: "goal_1",
-          expectedRevision: 2,
-        });
-        expect(rejected).toMatchObject({
-          ok: false,
-          error: { code: "invalid_transition" },
-        });
-      }
+      const rejected = await fixture.runtime.run({
+        type: "pause",
+        threadId: "thr_one",
+        goalId: "goal_1",
+        expectedRevision: 2,
+      });
+      expect(rejected).toMatchObject({
+        ok: false,
+        error: { code: "invalid_transition" },
+      });
+      const resumed = await fixture.runtime.run({
+        type: "resume",
+        threadId: "thr_one",
+        goalId: "goal_1",
+        expectedRevision: 2,
+      });
+      expect(resumed).toMatchObject({
+        ok: true,
+        goal: { state: "active", revision: 3 },
+      });
 
       const canceled = await fixture.runtime.run({
         type: "cancel",
         threadId: "thr_one",
         goalId: "goal_1",
-        expectedRevision: 2,
+        expectedRevision: 3,
       });
       expect(canceled).toMatchObject({
         ok: true,
-        goal: { state: "canceled", revision: 3 },
+        goal: { state: "canceled", revision: 4 },
       });
     } finally {
       await fixture.close();
@@ -1456,6 +1464,190 @@ describe("Goal coordinator", () => {
         fixture.runtime.processContinuation(new AbortController().signal),
       ).resolves.toBe(true);
       expect(fixture.continuationSends()).toBe(1);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("pauses ordinary failures and makes plugin delivery failures non-retryable", async () => {
+    const fixture = makeFixture();
+    try {
+      await fixture.runtime.run({
+        type: "start",
+        threadId: "thr_one",
+        objective: "stop after a provider failure",
+      });
+      await fixture.runtime.enqueueIdle("thr_one", "failure-opportunity");
+      const failed = await fixture.runtime.recordFailure("thr_one", {
+        kind: "ordinary",
+        source: "provider",
+        reason: "Provider connection failed",
+      });
+      expect(failed).toMatchObject({
+        state: "paused",
+        revision: 2,
+        pauseReasonCode: "failure",
+        pauseReason: "Provider connection failed",
+      });
+      await expect(
+        fixture.runtime.processContinuation(new AbortController().signal),
+      ).resolves.toBe(true);
+      expect(fixture.continuationSends()).toBe(0);
+      expect(
+        await fixture.runtime.run({ type: "status", threadId: "thr_one" }),
+      ).toMatchObject({ goal: { state: "paused", revision: 2 } });
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("persists subscription reset waits across restart and recovers only after reset", async () => {
+    const fixture = makeFixture();
+    try {
+      await fixture.runtime.run({
+        type: "start",
+        threadId: "thr_one",
+        objective: "wait for provider capacity",
+      });
+      const waiting = await fixture.runtime.recordFailure("thr_one", {
+        kind: "usage-limit",
+        limitKind: "subscription-window",
+        reason: "Subscription window is exhausted",
+        resetAt: "2026-08-22T12:05:00.000Z",
+      });
+      expect(waiting).toMatchObject({
+        state: "waiting",
+        revision: 2,
+        pauseReasonCode: "usage-limit",
+        usageLimitKind: "subscription-window",
+        usageResetAt: "2026-08-22T12:05:00.000Z",
+      });
+      expect(
+        fixture.database
+          .prepare(
+            "SELECT state, pause_reason_code AS reason, usage_reset_at AS resetAt FROM goals WHERE id = ?",
+          )
+          .get("goal_1"),
+      ).toEqual({
+        state: "waiting",
+        reason: "usage-limit",
+        resetAt: "2026-08-22T12:05:00.000Z",
+      });
+
+      await fixture.runtime.dispose();
+      const beforeReset = makeGoalRuntime(
+        fixture.database,
+        {
+          threadExists: async () => true,
+          readThread: async () => idleThreadSnapshot,
+          sendContinuation: async () => {},
+        },
+        {
+          nextGoalId: () => "unused_before_reset",
+          nowIso: () => "2026-08-22T12:04:59.000Z",
+        },
+      );
+      expect(await beforeReset.recoverUsageLimits()).toEqual([]);
+      await expect(
+        beforeReset.run({ type: "status", threadId: "thr_one" }),
+      ).resolves.toMatchObject({ goal: { state: "waiting", revision: 2 } });
+      await beforeReset.dispose();
+
+      let sends = 0;
+      const afterReset = makeGoalRuntime(
+        fixture.database,
+        {
+          threadExists: async () => true,
+          readThread: async () => idleThreadSnapshot,
+          sendContinuation: async () => {
+            sends += 1;
+          },
+        },
+        {
+          nextGoalId: () => "unused_after_reset",
+          nowIso: () => "2026-08-22T12:05:00.000Z",
+        },
+      );
+      try {
+        const recovered = await afterReset.recoverUsageLimits();
+        expect(recovered).toMatchObject([
+          {
+            id: "goal_1",
+            state: "active",
+            revision: 3,
+            pauseReasonCode: null,
+            usageResetAt: null,
+          },
+        ]);
+        await afterReset.enqueueIdle("thr_one", "usage-reset:goal_1:3");
+        await expect(
+          afterReset.processContinuation(new AbortController().signal),
+        ).resolves.toBe(true);
+        expect(sends).toBe(1);
+      } finally {
+        await afterReset.dispose();
+      }
+    } finally {
+      if (fixture.database.open) fixture.database.close();
+      rmSync(fixture.directory, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps credit limits manual and wins the reset/manual race without double recovery", async () => {
+    const fixture = makeFixture();
+    try {
+      await fixture.runtime.run({
+        type: "start",
+        threadId: "thr_one",
+        objective: "wait for a manually managed credit limit",
+      });
+      const paused = await fixture.runtime.recordFailure("thr_one", {
+        kind: "usage-limit",
+        limitKind: "credits",
+        reason: "Provider credits are exhausted",
+        resetAt: null,
+      });
+      expect(paused).toMatchObject({
+        state: "paused",
+        revision: 2,
+        pauseReasonCode: "usage-limit",
+        usageLimitKind: "credits",
+        usageResetAt: null,
+      });
+      expect(await fixture.runtime.recoverUsageLimits()).toEqual([]);
+      const resumed = await fixture.runtime.run({
+        type: "resume",
+        threadId: "thr_one",
+        goalId: "goal_1",
+        expectedRevision: 2,
+      });
+      expect(resumed).toMatchObject({
+        ok: true,
+        goal: {
+          state: "active",
+          revision: 3,
+          pauseReasonCode: null,
+          usageLimitKind: null,
+        },
+      });
+
+      await fixture.runtime.recordFailure("thr_one", {
+        kind: "usage-limit",
+        limitKind: "subscription-window",
+        reason: "A later subscription window is exhausted",
+        resetAt: "2026-08-22T12:05:00.000Z",
+      });
+      const manuallyResumed = await fixture.runtime.run({
+        type: "resume",
+        threadId: "thr_one",
+        goalId: "goal_1",
+        expectedRevision: 4,
+      });
+      expect(manuallyResumed).toMatchObject({
+        ok: true,
+        goal: { state: "active", revision: 5 },
+      });
+      expect(await fixture.runtime.recoverUsageLimits()).toEqual([]);
     } finally {
       await fixture.close();
     }
