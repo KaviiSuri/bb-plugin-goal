@@ -11,6 +11,7 @@ import {
   GoalThreadNotFound,
   type GoalCommand,
   type GoalDto,
+  type GoalFailure,
   type GoalError,
   type GoalHistoryPage,
 } from "./domain";
@@ -319,6 +320,16 @@ export class GoalCoordinator extends Context.Service<
             return { goal: yield* repository.current(command.threadId) };
           }
 
+          if (command.type === "failure") {
+            return {
+              goal: yield* repository.recordFailure({
+                threadId: command.threadId,
+                failure: command.failure,
+                now: yield* clock.nowIso,
+              }),
+            };
+          }
+
           if (command.type === "history") {
             if (
               !Number.isInteger(command.limit) ||
@@ -452,6 +463,8 @@ interface GoalContinuationCoordinatorService {
     request: GoalContinuationRequest,
   ) => Effect.Effect<GoalContinuationRecord | null, GoalError>;
   readonly recover: () => Effect.Effect<void, GoalError>;
+  readonly recoverUsageLimits: () => Effect.Effect<readonly GoalDto[], GoalError>;
+  readonly nextUsageLimitReset: () => Effect.Effect<string | null, GoalError>;
   readonly process: (
     signal?: AbortSignal,
   ) => Effect.Effect<GoalContinuationProcessResult, GoalError>;
@@ -529,6 +542,17 @@ export class GoalContinuationCoordinator extends Context.Service<
           }
         },
       );
+
+      const recoverUsageLimits = Effect.fn(
+        "GoalContinuationCoordinator.recoverUsageLimits",
+      )(function* () {
+        const now = yield* clock.nowIso;
+        return yield* repository.recoverUsageLimits(now);
+      });
+
+      const nextUsageLimitReset = Effect.fn(
+        "GoalContinuationCoordinator.nextUsageLimitReset",
+      )(() => repository.nextUsageLimitReset());
 
       const process = Effect.fn("GoalContinuationCoordinator.process")(
         function* (signal?: AbortSignal) {
@@ -629,6 +653,17 @@ export class GoalContinuationCoordinator extends Context.Service<
               signal,
             );
           } catch (cause) {
+            yield* repository.recordFailure({
+              threadId: continuation.threadId,
+              failure: {
+                kind: "ordinary",
+                source: "plugin",
+                reason: `Continuation delivery failed: ${
+                  cause instanceof Error ? cause.message : String(cause)
+                }`,
+              },
+              now: lease.now,
+            });
             yield* release(
               cause instanceof Error ? cause.message : String(cause),
             );
@@ -648,6 +683,8 @@ export class GoalContinuationCoordinator extends Context.Service<
       return GoalContinuationCoordinator.of({
         enqueueIdle,
         recover,
+        recoverUsageLimits,
+        nextUsageLimitReset,
         process,
       });
     }),

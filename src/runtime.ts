@@ -14,6 +14,8 @@ import {
   goalErrorToDto,
   type GoalCommand,
   type GoalCommandResult,
+  type GoalDto,
+  type GoalFailure,
 } from "./domain";
 import { makeGoalRepositoryLayer } from "./repository";
 
@@ -23,7 +25,13 @@ export interface GoalRuntime {
     threadId: string,
     opportunityKey: string,
   ) => Promise<void>;
+  readonly recordFailure: (
+    threadId: string,
+    failure: GoalFailure,
+  ) => Promise<GoalDto | null>;
   readonly recoverContinuations: () => Promise<void>;
+  readonly recoverUsageLimits: () => Promise<readonly GoalDto[]>;
+  readonly nextUsageLimitReset: () => Promise<string | null>;
   readonly processContinuation: (signal: AbortSignal) => Promise<boolean>;
   readonly dispose: () => Promise<void>;
 }
@@ -88,9 +96,31 @@ export function makeGoalRuntime(
         ),
       );
     },
+    async recordFailure(threadId, failure) {
+      const result = await runtime.runPromise(
+        GoalCoordinator.use((coordinator) =>
+          coordinator.execute({ type: "failure", threadId, failure }),
+        ),
+      );
+      return "goal" in result ? result.goal : null;
+    },
     async recoverContinuations() {
       await runtime.runPromise(
         GoalContinuationCoordinator.use((coordinator) => coordinator.recover()),
+      );
+    },
+    async recoverUsageLimits() {
+      return runtime.runPromise(
+        GoalContinuationCoordinator.use((coordinator) =>
+          coordinator.recoverUsageLimits(),
+        ),
+      );
+    },
+    async nextUsageLimitReset() {
+      return runtime.runPromise(
+        GoalContinuationCoordinator.use((coordinator) =>
+          coordinator.nextUsageLimitReset(),
+        ),
       );
     },
     async processContinuation(signal) {

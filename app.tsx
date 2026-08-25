@@ -42,6 +42,15 @@ interface GoalView {
   readonly blockageExternalAction: string | null;
   readonly blockageEvidence: string | null;
   readonly blockageRepeatedTurns: number | null;
+  readonly pauseReasonCode: "manual" | "failure" | "usage-limit" | null;
+  readonly pauseReason: string | null;
+  readonly usageLimitKind:
+    | "subscription-window"
+    | "credits"
+    | "spend-control"
+    | "unknown"
+    | null;
+  readonly usageResetAt: string | null;
 }
 
 type ViewState =
@@ -70,7 +79,7 @@ function goalStateLabel(state: GoalState): string {
     case "paused":
       return "Paused Goal";
     case "waiting":
-      return "Waiting Goal";
+      return "Waiting for usage reset";
     case "completed":
       return "Completed Goal";
     case "blocked":
@@ -237,6 +246,24 @@ export function GoalHistoryPanel({ threadId }: { readonly threadId: string }) {
                         <p className="mt-1 whitespace-pre-wrap text-muted-foreground">
                           {goal.verificationEvidence}
                         </p>
+                      </div>
+                    ) : null}
+                    {goal.pauseReason !== null ? (
+                      <div className="mt-3 rounded-md bg-muted/50 p-2 text-sm">
+                        <p className="font-medium text-foreground">
+                          Why Goal work paused
+                        </p>
+                        <p className="mt-1 whitespace-pre-wrap text-muted-foreground">
+                          {goal.pauseReason}
+                        </p>
+                        {goal.usageLimitKind !== null ? (
+                          <p className="mt-1 text-xs text-muted-foreground">
+                            Usage limit: {goal.usageLimitKind}
+                            {goal.usageResetAt === null
+                              ? " (manual resume required)"
+                              : ` · resets ${goal.usageResetAt}`}
+                          </p>
+                        ) : null}
                       </div>
                     ) : null}
                     {goal.blockageExternalAction !== null ? (
@@ -591,9 +618,10 @@ export function GoalComposerRow() {
           </span>
           <span
             className="min-w-0 flex-1 truncate text-muted-foreground"
-            title={view.goal.objective}
+            title={view.goal.pauseReason ?? view.goal.objective}
           >
             {view.goal.objective}
+            {view.goal.pauseReason === null ? "" : ` · ${view.goal.pauseReason}`}
           </span>
           <div className="flex shrink-0 items-center gap-1">
             <Button
@@ -626,7 +654,7 @@ export function GoalComposerRow() {
                 {pending === "pause" ? "Pausing" : "Pause Goal"}
               </Button>
             ) : null}
-            {view.goal.state === "paused" ? (
+            {view.goal.state === "paused" || view.goal.state === "waiting" ? (
               <Button
                 size="sm"
                 variant="ghost"

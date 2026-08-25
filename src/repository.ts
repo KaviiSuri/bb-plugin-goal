@@ -12,6 +12,7 @@ import {
   type GoalBlockedCommand,
   type GoalCompletionCommand,
   type GoalDto,
+  type GoalFailure,
   type GoalGuardedAction,
   type GoalHistoryPage,
   type GoalMutationCommand,
@@ -90,6 +91,10 @@ export const GOAL_MIGRATIONS = [
   CREATE INDEX IF NOT EXISTS goal_continuations_pending
     ON goal_continuations(state, lease_expires_at, created_at)`,
   `ALTER TABLE goal_continuations ADD COLUMN delivery_marker TEXT`,
+  `ALTER TABLE goals ADD COLUMN pause_reason_code TEXT;
+   ALTER TABLE goals ADD COLUMN pause_reason TEXT;
+   ALTER TABLE goals ADD COLUMN usage_limit_kind TEXT;
+   ALTER TABLE goals ADD COLUMN usage_reset_at TEXT`,
 ] as const;
 
 export function migrateGoalDatabase(database: BetterSqlite3.Database): void {
@@ -113,6 +118,12 @@ export interface MutateGoalRecord {
     | GoalMutationCommand
     | GoalCompletionCommand
     | GoalBlockedCommand;
+  readonly now: string;
+}
+
+export interface RecordGoalFailure {
+  readonly threadId: string;
+  readonly failure: GoalFailure;
   readonly now: string;
 }
 
@@ -212,6 +223,13 @@ interface GoalRepositoryService {
   readonly mutate: (
     record: MutateGoalRecord,
   ) => Effect.Effect<GoalDto, GoalMutationError>;
+  readonly recordFailure: (
+    record: RecordGoalFailure,
+  ) => Effect.Effect<GoalDto | null, GoalPersistenceError>;
+  readonly recoverUsageLimits: (
+    now: string,
+  ) => Effect.Effect<readonly GoalDto[], GoalPersistenceError>;
+  readonly nextUsageLimitReset: () => Effect.Effect<string | null, GoalPersistenceError>;
   readonly delete: (
     record: DeleteGoalRecord,
   ) => Effect.Effect<GoalDto, GoalDeleteError>;
@@ -260,6 +278,10 @@ type GoalRow = {
   readonly blockageExternalAction: string | null;
   readonly blockageEvidence: string | null;
   readonly blockageRepeatedTurns: number | null;
+  readonly pauseReasonCode: string | null;
+  readonly pauseReason: string | null;
+  readonly usageLimitKind: string | null;
+  readonly usageResetAt: string | null;
 };
 
 type GoalHistoryRow = GoalRow & { readonly historySequence: number };
@@ -308,7 +330,7 @@ function permitsMutation(goal: GoalDto, action: GoalGuardedAction): boolean {
     case "block":
       return goal.state === "active";
     case "resume":
-      return goal.state === "paused";
+      return goal.state === "paused" || goal.state === "waiting";
   }
 }
 
@@ -348,7 +370,11 @@ const goalColumns = `SELECT
     verification_evidence AS verificationEvidence,
     blockage_external_action AS blockageExternalAction,
     blockage_evidence AS blockageEvidence,
-    blockage_repeated_turns AS blockageRepeatedTurns
+    blockage_repeated_turns AS blockageRepeatedTurns,
+    pause_reason_code AS pauseReasonCode,
+    pause_reason AS pauseReason,
+    usage_limit_kind AS usageLimitKind,
+    usage_reset_at AS usageResetAt
   FROM goals`;
 
 export interface CurrentGoalSnapshotReader {
@@ -394,6 +420,10 @@ export function makeGoalRepositoryLayer(
           goals.blockage_external_action AS blockageExternalAction,
           goals.blockage_evidence AS blockageEvidence,
           goals.blockage_repeated_turns AS blockageRepeatedTurns,
+          goals.pause_reason_code AS pauseReasonCode,
+          goals.pause_reason AS pauseReason,
+          goals.usage_limit_kind AS usageLimitKind,
+          goals.usage_reset_at AS usageResetAt,
           goal_history_order.sequence AS historySequence
         FROM goals
         INNER JOIN goal_history_order
@@ -445,13 +475,46 @@ export function makeGoalRepositoryLayer(
       );
       const pause = database.prepare(
         `UPDATE goals
-          SET state = 'paused', revision = revision + 1, updated_at = ?
+          SET state = 'paused', revision = revision + 1, updated_at = ?,
+            pause_reason_code = 'manual', pause_reason = 'Paused by user',
+            usage_limit_kind = NULL, usage_reset_at = NULL
           WHERE id = ? AND thread_id = ? AND revision = ? AND state = 'active' AND finished_at IS NULL`,
       );
       const resume = database.prepare(
         `UPDATE goals
-          SET state = 'active', revision = revision + 1, updated_at = ?
-          WHERE id = ? AND thread_id = ? AND revision = ? AND state = 'paused' AND finished_at IS NULL`,
+          SET state = 'active', revision = revision + 1, updated_at = ?,
+            pause_reason_code = NULL, pause_reason = NULL,
+            usage_limit_kind = NULL, usage_reset_at = NULL
+          WHERE id = ? AND thread_id = ? AND revision = ? AND state IN ('paused', 'waiting') AND finished_at IS NULL`,
+      );
+      const recordFailure = database.prepare(
+        `UPDATE goals
+          SET state = ?, revision = revision + 1, updated_at = ?,
+            pause_reason_code = ?, pause_reason = ?, usage_limit_kind = ?,
+            usage_reset_at = ?
+          WHERE id = ? AND thread_id = ? AND state = 'active' AND finished_at IS NULL`,
+      );
+      const recoverUsageLimit = database.prepare(
+        `UPDATE goals
+          SET state = 'active', revision = revision + 1, updated_at = ?,
+            pause_reason_code = NULL, pause_reason = NULL,
+            usage_limit_kind = NULL, usage_reset_at = NULL
+          WHERE id = ? AND state = 'waiting'
+            AND pause_reason_code = 'usage-limit'
+            AND usage_reset_at IS NOT NULL AND usage_reset_at <= ?
+            AND finished_at IS NULL`,
+      );
+      const selectDueUsageLimits = database.prepare<[string], GoalRow>(
+        `${goalColumns} WHERE state = 'waiting'
+          AND pause_reason_code = 'usage-limit'
+          AND usage_reset_at IS NOT NULL AND usage_reset_at <= ?
+          AND finished_at IS NULL
+          ORDER BY usage_reset_at, id`,
+      );
+      const selectNextUsageLimitReset = database.prepare<[], { readonly usageResetAt: string }>(
+        `SELECT MIN(usage_reset_at) AS usageResetAt FROM goals
+          WHERE state = 'waiting' AND pause_reason_code = 'usage-limit'
+            AND usage_reset_at IS NOT NULL AND finished_at IS NULL`,
       );
       const cancel = database.prepare(
         `UPDATE goals
@@ -789,6 +852,49 @@ export function makeGoalRepositoryLayer(
         },
       );
 
+      const recordFailureTransaction = database.transaction(
+        (record: RecordGoalFailure): GoalDto | null => {
+          const current = readCurrent(record.threadId);
+          if (current === null || current.state !== "active") return current;
+          const usageWait =
+            record.failure.kind === "usage-limit" &&
+            record.failure.limitKind === "subscription-window" &&
+            record.failure.resetAt !== null &&
+            record.failure.resetAt > record.now;
+          const result = recordFailure.run(
+            usageWait ? "waiting" : "paused",
+            record.now,
+            "usage-limit" === record.failure.kind
+              ? "usage-limit"
+              : "failure",
+            record.failure.reason,
+            record.failure.kind === "usage-limit"
+              ? record.failure.limitKind
+              : null,
+            usageWait ? record.failure.resetAt : null,
+            current.id,
+            record.threadId,
+          );
+          if (result.changes !== 1) return readCurrent(record.threadId);
+          return readCurrent(record.threadId);
+        },
+      );
+
+      const recoverUsageLimitsTransaction = database.transaction(
+        (now: string): readonly GoalDto[] => {
+          const due = selectDueUsageLimits.all(now);
+          const recovered: GoalDto[] = [];
+          for (const row of due) {
+            const result = recoverUsageLimit.run(now, row.id, now);
+            if (result.changes === 1) {
+              const updated = readById(row.id);
+              if (updated !== null) recovered.push(updated);
+            }
+          }
+          return recovered;
+        },
+      );
+
       const deleteTransaction = database.transaction(
         (record: DeleteGoalRecord): GoalDto => {
           const before = readByThreadAndId(record.goalId, record.threadId);
@@ -927,6 +1033,41 @@ export function makeGoalRepositoryLayer(
             try: () => deleteTransaction(record),
             catch: deleteErrorFromCause,
           }),
+      );
+
+      const recordFailureEffect = Effect.fn("GoalRepository.recordFailure")(
+        (record: RecordGoalFailure) =>
+          Effect.try({
+            try: () => recordFailureTransaction(record),
+            catch: (cause) =>
+              new GoalPersistenceError({
+                message: `Could not persist Goal failure: ${messageFromCause(cause)}`,
+              }),
+          }),
+      );
+
+      const recoverUsageLimitsEffect = Effect.fn(
+        "GoalRepository.recoverUsageLimits",
+      )((now: string) =>
+        Effect.try({
+          try: () => recoverUsageLimitsTransaction(now),
+          catch: (cause) =>
+            new GoalPersistenceError({
+              message: `Could not recover Goal usage limits: ${messageFromCause(cause)}`,
+            }),
+        }),
+      );
+
+      const nextUsageLimitReset = Effect.fn(
+        "GoalRepository.nextUsageLimitReset",
+      )(() =>
+        Effect.try({
+          try: () => selectNextUsageLimitReset.get()?.usageResetAt ?? null,
+          catch: (cause) =>
+            new GoalPersistenceError({
+              message: `Could not read Goal usage resets: ${messageFromCause(cause)}`,
+            }),
+        }),
       );
 
       const enqueueContinuation = Effect.fn("GoalRepository.enqueueContinuation")(
@@ -1078,6 +1219,9 @@ export function makeGoalRepositoryLayer(
         start,
         mutate,
         delete: deleteGoal,
+        recordFailure: recordFailureEffect,
+        recoverUsageLimits: recoverUsageLimitsEffect,
+        nextUsageLimitReset,
         enqueueContinuation,
         recoverContinuations,
         sendingContinuations,

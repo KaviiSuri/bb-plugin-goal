@@ -11,6 +11,7 @@ import {
   GOAL_HISTORY_DEFAULT_LIMIT,
   GOAL_HISTORY_MAX_LIMIT,
   goalStates,
+  type GoalFailure,
   type GoalCommandResult,
   type GoalDto,
   type GoalHistoryPage,
@@ -25,6 +26,7 @@ import {
   type GoalRuntime,
 } from "./src/runtime";
 import type { GoalThreadGatewayAdapter } from "./src/coordinator";
+import { classifyGoalFailure } from "./src/failure";
 
 export const GOAL_REALTIME_CHANNEL = "goal.changed";
 
@@ -43,6 +45,12 @@ const goalSchema = z
     blockageExternalAction: z.string().nullable(),
     blockageEvidence: z.string().nullable(),
     blockageRepeatedTurns: z.number().int().nullable(),
+    pauseReasonCode: z.enum(["manual", "failure", "usage-limit"]).nullable(),
+    pauseReason: z.string().nullable(),
+    usageLimitKind: z
+      .enum(["subscription-window", "credits", "spend-control", "unknown"])
+      .nullable(),
+    usageResetAt: z.string().nullable(),
   })
   .strict();
 
@@ -179,6 +187,15 @@ function formatGoal(goal: GoalDto, heading: string): string {
     ...(goal.blockageRepeatedTurns === null
       ? []
       : [`Repeated blocker turns: ${goal.blockageRepeatedTurns}`]),
+    ...(goal.pauseReason === null
+      ? []
+      : [`Pause reason: ${goal.pauseReason}`]),
+    ...(goal.usageLimitKind === null
+      ? []
+      : [`Usage limit: ${goal.usageLimitKind}`]),
+    ...(goal.usageResetAt === null
+      ? []
+      : [`Usage reset at: ${goal.usageResetAt}`]),
   ].join("\n");
 }
 
@@ -760,6 +777,26 @@ async function runCli(
   }
 }
 
+async function classifyThreadFailure(
+  bb: BbPluginApi,
+  threadId: string,
+  fallbackMessage: string | null,
+  signal?: AbortSignal,
+): Promise<GoalFailure> {
+  const events = await bb.sdk.threads.events.list({
+    threadId,
+    order: "desc",
+    limit: "50",
+    types: ["provider/error", "provider/rateLimits/updated", "system/error"],
+    signal,
+  });
+  return classifyGoalFailure(
+    events.map((event) => ({ type: event.type, data: event.data })),
+    Date.now(),
+    fallbackMessage,
+  );
+}
+
 export function createPlugin(
   dependencies: PluginDependencies = liveDependencies,
 ): (bb: BbPluginApi) => Promise<void> {
@@ -898,19 +935,52 @@ export function createPlugin(
       }
     });
 
+    bb.events.on("thread.failed", async ({ thread, error }) => {
+      if (disposed) return;
+      try {
+        const failure = await classifyThreadFailure(bb, thread.id, error);
+        const goal = await runtime.recordFailure(thread.id, failure);
+        if (goal !== null) publishGoalChanged(bb, goal);
+        wake();
+      } catch (cause) {
+        if (!disposed) {
+          bb.log.error(
+            `Could not record failed Goal turn: ${
+              cause instanceof Error ? cause.message : String(cause)
+            }`,
+          );
+        }
+      }
+    });
+
     bb.background.service("continuations", {
       async start(signal) {
         let retryDelayMs = CONTINUATION_RETRY_BASE_MS;
         while (!signal.aborted) {
           try {
             await retryPendingIdleEvents(signal);
+            const recoveredGoals = await runtime.recoverUsageLimits();
+            for (const goal of recoveredGoals) {
+              await runtime.enqueueIdle(
+                goal.threadId,
+                `usage-reset:${goal.id}:${goal.revision}`,
+              );
+            }
             await runtime.recoverContinuations();
             let claimed = false;
             do {
               claimed = await runtime.processContinuation(signal);
             } while (claimed && !signal.aborted);
             retryDelayMs = CONTINUATION_RETRY_BASE_MS;
-            if (!signal.aborted) await waitForWork(signal);
+            if (!signal.aborted) {
+              const nextReset = await runtime.nextUsageLimitReset();
+              const parsedReset = nextReset === null ? Number.NaN : Date.parse(nextReset);
+              const waitMs = Number.isFinite(parsedReset)
+                ? Math.max(0, parsedReset - Date.now())
+                : null;
+              if (pendingIdleEvents.size > 0) continue;
+              await waitForWork(signal, waitMs);
+            }
           } catch (cause) {
             if (signal.aborted) break;
             bb.log.error(

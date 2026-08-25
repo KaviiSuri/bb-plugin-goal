@@ -14,6 +14,17 @@ export type GoalState = (typeof goalStates)[number];
 export const goalMutationTypes = ["edit", "pause", "resume", "cancel"] as const;
 export type GoalMutationType = (typeof goalMutationTypes)[number];
 
+export const goalPauseReasonCodes = ["manual", "failure", "usage-limit"] as const;
+export type GoalPauseReasonCode = (typeof goalPauseReasonCodes)[number];
+
+export const goalUsageLimitKinds = [
+  "subscription-window",
+  "credits",
+  "spend-control",
+  "unknown",
+] as const;
+export type GoalUsageLimitKind = (typeof goalUsageLimitKinds)[number];
+
 export const goalGuardedActionTypes = [
   ...goalMutationTypes,
   "complete",
@@ -38,6 +49,10 @@ export const GoalDtoSchema = Schema.Struct({
   blockageExternalAction: Schema.NullOr(Schema.String),
   blockageEvidence: Schema.NullOr(Schema.String),
   blockageRepeatedTurns: Schema.NullOr(Schema.Int),
+  pauseReasonCode: Schema.NullOr(Schema.Literals(goalPauseReasonCodes)),
+  pauseReason: Schema.NullOr(Schema.String),
+  usageLimitKind: Schema.NullOr(Schema.Literals(goalUsageLimitKinds)),
+  usageResetAt: Schema.NullOr(Schema.String),
 });
 
 export interface GoalDto {
@@ -54,6 +69,10 @@ export interface GoalDto {
   readonly blockageExternalAction: string | null;
   readonly blockageEvidence: string | null;
   readonly blockageRepeatedTurns: number | null;
+  readonly pauseReasonCode: GoalPauseReasonCode | null;
+  readonly pauseReason: string | null;
+  readonly usageLimitKind: GoalUsageLimitKind | null;
+  readonly usageResetAt: string | null;
 }
 
 export interface GoalHistoryPage {
@@ -67,11 +86,29 @@ interface GuardedGoalCommand {
   readonly expectedRevision: number;
 }
 
+export type GoalFailure =
+  | {
+      readonly kind: "ordinary";
+      readonly source: "provider" | "turn" | "plugin";
+      readonly reason: string;
+    }
+  | {
+      readonly kind: "usage-limit";
+      readonly limitKind: GoalUsageLimitKind;
+      readonly reason: string;
+      readonly resetAt: string | null;
+    };
+
 export type GoalCommand =
   | {
       readonly type: "start";
       readonly threadId: string;
       readonly objective: string;
+    }
+  | {
+      readonly type: "failure";
+      readonly threadId: string;
+      readonly failure: GoalFailure;
     }
   | {
       readonly type: "status";

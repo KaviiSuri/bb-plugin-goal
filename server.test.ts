@@ -305,6 +305,102 @@ describe("Goal BB adapter", () => {
     }
   });
 
+  it("pauses a failed Goal from structured provider rate-limit events", async () => {
+    const resetAt = Date.parse("2099-08-22T12:05:00.000Z");
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "goal",
+      sdk: {
+        threads: {
+          get: async ({ threadId }) =>
+            makeThreadResponse({
+              id: threadId,
+              status: "error",
+              environmentId: "env_test",
+            }),
+          queuedMessages: { list: async () => [] },
+          interactions: { list: async () => [] },
+          timeline: async () => ({ rows: [], activePromptMode: null }),
+          events: {
+            list: async () => [
+              {
+                id: "event-rate-limit",
+                seq: 8,
+                createdAt: resetAt - 1,
+                scope: { kind: "thread" },
+                threadId: "thr_failure",
+                type: "provider/rateLimits/updated",
+                data: {
+                  rateLimits: {
+                    kind: "subscription-window",
+                    status: "blocked",
+                    providerId: "test-provider",
+                    reachedReason: "subscription window exhausted",
+                    overageReason: null,
+                    overageStatus: null,
+                    windows: [
+                      {
+                        label: "hour",
+                        providerKey: "hour",
+                        status: "blocked",
+                        resetsAtMs: resetAt,
+                      },
+                    ],
+                  },
+                },
+              },
+            ],
+          },
+        },
+      },
+    });
+    await deterministicPlugin()(bb);
+    try {
+      await harness.behavior.callRpc("start", {
+        threadId: "thr_failure",
+        objective: "pause safely on provider capacity",
+      });
+      const database = bb.storage.database();
+      const eventResult = await harness.behavior.emitThreadEvent(
+        "thread.failed",
+        {
+          thread: makeThreadResponse({
+            id: "thr_failure",
+            status: "error",
+            environmentId: "env_test",
+          }),
+          error: "assistant prose must not classify usage limits",
+        },
+      );
+      expect(eventResult.errors).toEqual([]);
+      await waitUntil(
+        () =>
+          (
+            database
+              .prepare("SELECT state FROM goals WHERE thread_id = ?")
+              .get("thr_failure") as { state: string } | undefined
+          )?.state === "waiting",
+      );
+      await expect(
+        harness.behavior.callRpc("status", { threadId: "thr_failure" }),
+      ).resolves.toMatchObject({
+        goal: {
+          state: "waiting",
+          pauseReasonCode: "usage-limit",
+          usageLimitKind: "subscription-window",
+          usageResetAt: "2099-08-22T12:05:00.000Z",
+        },
+      });
+      const cli = await harness.behavior.runCli(["status"], {
+        threadId: "thr_failure",
+      });
+      expect(cli.stdout).toContain("Pause reason: subscription window exhausted");
+      expect(cli.stdout).toContain("Usage limit: subscription-window");
+      expect(cli.stdout).toContain("Usage reset at: 2099-08-22T12:05:00.000Z");
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
   it("rechecks the fake host after sending is claimed and releases a late queued message", async () => {
     let readCount = 0;
     let queued = false;
@@ -750,7 +846,10 @@ describe("Goal BB adapter", () => {
             return runtime.run(command);
           },
           enqueueIdle: runtime.enqueueIdle,
+          recordFailure: runtime.recordFailure,
           recoverContinuations: runtime.recoverContinuations,
+          recoverUsageLimits: runtime.recoverUsageLimits,
+          nextUsageLimitReset: runtime.nextUsageLimitReset,
           processContinuation: runtime.processContinuation,
           dispose: runtime.dispose,
         };
@@ -1778,7 +1877,10 @@ describe("Goal BB adapter", () => {
         return {
           run: runtime.run,
           enqueueIdle: runtime.enqueueIdle,
+          recordFailure: runtime.recordFailure,
           recoverContinuations: runtime.recoverContinuations,
+          recoverUsageLimits: runtime.recoverUsageLimits,
+          nextUsageLimitReset: runtime.nextUsageLimitReset,
           processContinuation: runtime.processContinuation,
           async dispose() {
             expect(database.open).toBe(true);

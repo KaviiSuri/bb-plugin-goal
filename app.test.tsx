@@ -24,6 +24,10 @@ const activeGoal = {
   blockageExternalAction: null,
   blockageEvidence: null,
   blockageRepeatedTurns: null,
+  pauseReasonCode: null,
+  pauseReason: null,
+  usageLimitKind: null,
+  usageResetAt: null,
 };
 
 type RpcHandlers = PluginRpcTestHandlers<typeof rpcContract>;
@@ -230,11 +234,11 @@ describe("Goal composer row", () => {
       },
     );
     try {
-      expect(await slot.findByText("Waiting Goal")).toBeTruthy();
+      expect(await slot.findByText("Waiting for usage reset")).toBeTruthy();
       expect(slot.getByRole("button", { name: "Edit Goal" })).toBeTruthy();
       expect(slot.getByRole("button", { name: "Cancel Goal" })).toBeTruthy();
       expect(slot.queryByRole("button", { name: "Pause Goal" })).toBeNull();
-      expect(slot.queryByRole("button", { name: "Resume Goal" })).toBeNull();
+      expect(slot.getByRole("button", { name: "Resume Goal" })).toBeTruthy();
     } finally {
       slot.lifecycle.unmount();
     }
@@ -386,6 +390,33 @@ describe("Goal composer row", () => {
       expect(await slot.findByText("Completed Goal")).toBeTruthy();
       expect(slot.getByText(completed.completionSummary!)).toBeTruthy();
       expect(slot.getByText(completed.verificationEvidence!)).toBeTruthy();
+    } finally {
+      slot.lifecycle.unmount();
+    }
+  });
+
+  it("shows durable failure and manual usage recovery details in history", async () => {
+    const paused: Goal = {
+      ...activeGoal,
+      state: "paused",
+      revision: 2,
+      pauseReasonCode: "usage-limit",
+      pauseReason: "Provider credits are exhausted",
+      usageLimitKind: "credits",
+      usageResetAt: null,
+    };
+    const slot = renderSlot<
+      { threadId: string; params: JsonValue | null },
+      typeof rpcContract
+    >(historyPanel(), { threadId: "thr_ui", params: null }, {
+      rpc: handlers(paused),
+    });
+    try {
+      expect(await slot.findByText("Paused Goal")).toBeTruthy();
+      expect(slot.getByText("Provider credits are exhausted")).toBeTruthy();
+      expect(
+        slot.getByText(/Usage limit: credits \(manual resume required\)/),
+      ).toBeTruthy();
     } finally {
       slot.lifecycle.unmount();
     }
