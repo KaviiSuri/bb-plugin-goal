@@ -32,6 +32,9 @@ export interface GoalRuntime {
     event?: GoalFailureEventIdentity,
     observedEvents?: readonly GoalFailureEventIdentity[],
   ) => Promise<GoalDto | null>;
+  readonly archiveThread: (threadId: string) => Promise<GoalDto | null>;
+  readonly deleteThread: (threadId: string) => Promise<void>;
+  readonly ownedThreadIds: () => Promise<readonly string[]>;
   readonly recoverContinuations: () => Promise<void>;
   readonly assessSettledContinuations: (
     signal?: AbortSignal,
@@ -115,6 +118,23 @@ export function makeGoalRuntime(
         ),
       );
       return "goal" in result ? result.goal : null;
+    },
+    archiveThread(threadId) {
+      return runtime.runPromise(
+        GoalCoordinator.use((coordinator) =>
+          coordinator.archiveThread(threadId),
+        ),
+      );
+    },
+    deleteThread(threadId) {
+      return runtime.runPromise(
+        GoalCoordinator.use((coordinator) => coordinator.deleteThread(threadId)),
+      );
+    },
+    ownedThreadIds() {
+      return runtime.runPromise(
+        GoalCoordinator.use((coordinator) => coordinator.ownedThreadIds()),
+      );
     },
     async recoverContinuations() {
       await runtime.runPromise(

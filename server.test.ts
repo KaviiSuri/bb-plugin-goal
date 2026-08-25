@@ -136,7 +136,266 @@ describe("Goal BB adapter", () => {
           { name: "delete" },
         ],
       });
+      expect(harness.inspection.registrations.threadEventHandlers).toMatchObject({
+        "thread.created": 1,
+        "thread.archived": 1,
+        "thread.deleted": 1,
+      });
     } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
+  it("uses authoritative archive state, leaves unarchive inert, and resumes explicitly", async () => {
+    let archivedAt: number | null = null;
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "goal",
+      sdk: {
+        threads: {
+          get: async ({ threadId }) =>
+            makeThreadResponse({ id: threadId, archivedAt, environmentId: "env_test" }),
+          queuedMessages: { list: async () => [] },
+          interactions: { list: async () => [] },
+          timeline: async () => ({ rows: [], activePromptMode: null }),
+        },
+      },
+    });
+    await deterministicPlugin()(bb);
+    try {
+      await harness.behavior.callRpc("start", {
+        threadId: "thr_lifecycle",
+        objective: "stay owned",
+      });
+      archivedAt = 100;
+      const archivePayload = {
+        thread: makeThreadResponse({
+          id: "thr_lifecycle",
+          archivedAt,
+          environmentId: "env_test",
+        }),
+      };
+      await expect(
+        harness.behavior.emitThreadEvent("thread.archived", archivePayload),
+      ).resolves.toEqual({ errors: [] });
+      await expect(
+        harness.behavior.callRpc("status", { threadId: "thr_lifecycle" }),
+      ).resolves.toMatchObject({
+        goal: { state: "paused", revision: 2, pauseReasonCode: "archived" },
+      });
+
+      await harness.behavior.emitThreadEvent("thread.archived", archivePayload);
+      await expect(
+        harness.behavior.callRpc("status", { threadId: "thr_lifecycle" }),
+      ).resolves.toMatchObject({ goal: { revision: 2 } });
+      await expect(
+        harness.behavior.callRpc("resume", {
+          threadId: "thr_lifecycle",
+          goalId: "goal_cli_1",
+          expectedRevision: 2,
+        }),
+      ).rejects.toThrow("archived");
+
+      archivedAt = null;
+      await harness.behavior.emitThreadEvent("thread.archived", archivePayload);
+      await expect(
+        harness.behavior.callRpc("status", { threadId: "thr_lifecycle" }),
+      ).resolves.toMatchObject({ goal: { state: "paused", revision: 2 } });
+      await expect(
+        harness.behavior.callRpc("resume", {
+          threadId: "thr_lifecycle",
+          goalId: "goal_cli_1",
+          expectedRevision: 2,
+        }),
+      ).resolves.toMatchObject({ goal: { state: "active", revision: 3 } });
+      expect(harness.inspection.realtimeSignals.at(-2)).toMatchObject({
+        channel: GOAL_REALTIME_CHANNEL,
+        payload: { threadId: "thr_lifecycle", pauseReasonCode: "archived" },
+      });
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
+  it("deletes thread-owned state and publishes a tombstone with no Goal DTO", async () => {
+    const { bb, harness } = fakeHost();
+    await deterministicPlugin()(bb);
+    try {
+      await harness.behavior.callRpc("start", {
+        threadId: "thr_deleted",
+        objective: "remove with thread",
+      });
+      const deletedThread = makeThreadResponse({
+        id: "thr_deleted",
+        deletedAt: 200,
+        environmentId: "env_test",
+      });
+      await harness.behavior.emitThreadEvent("thread.deleted", {
+        thread: deletedThread,
+      });
+      await harness.behavior.emitThreadEvent("thread.idle", {
+        thread: makeThreadResponse({
+          id: "thr_deleted",
+          status: "idle",
+          updatedAt: 199,
+          environmentId: "env_test",
+        }),
+        lastAssistantText: null,
+      });
+      await harness.behavior.emitThreadEvent("thread.deleted", {
+        thread: deletedThread,
+      });
+
+      const database = bb.storage.database();
+      expect(
+        database.prepare("SELECT COUNT(*) AS count FROM goals WHERE thread_id = ?").get("thr_deleted"),
+      ).toEqual({ count: 0 });
+      expect(
+        database.prepare("SELECT COUNT(*) AS count FROM goal_history_counters WHERE thread_id = ?").get("thr_deleted"),
+      ).toEqual({ count: 0 });
+      expect(harness.inspection.realtimeSignals.at(-1)).toEqual({
+        channel: GOAL_REALTIME_CHANNEL,
+        payload: {
+          threadId: "thr_deleted",
+          goalId: null,
+          revision: null,
+          state: null,
+          pauseReasonCode: null,
+          noProgressConsecutiveCount: null,
+          noProgressEvidence: null,
+          deleted: true,
+          lifecycle: "deleted",
+        },
+      });
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
+  it("reconciles a deletion missed while the plugin was unloaded", async () => {
+    let deleted = false;
+    const initial = createFakePluginHost({
+      pluginId: "goal",
+      sdk: {
+        threads: {
+          get: async ({ threadId }) => {
+            if (deleted) throw new Error(`Thread ${threadId} not found`);
+            return makeThreadResponse({ id: threadId, environmentId: "env_test" });
+          },
+          queuedMessages: { list: async () => [] },
+          interactions: { list: async () => [] },
+          timeline: async () => ({ rows: [], activePromptMode: null }),
+        },
+      },
+    });
+    const factory = deterministicPlugin();
+    await factory(initial.bb);
+    await initial.harness.behavior.callRpc("start", {
+      threadId: "thr_missed_delete",
+      objective: "clean up after reload",
+    });
+    deleted = true;
+    const reloaded = await initial.harness.lifecycle.reload(factory);
+    const service = reloaded.harness.behavior.runService("continuations");
+    try {
+      const database = reloaded.bb.storage.database();
+      await waitUntil(
+        () =>
+          (database
+            .prepare("SELECT COUNT(*) AS count FROM goals WHERE thread_id = ?")
+            .get("thr_missed_delete") as { readonly count: number }).count === 0,
+      );
+      expect(reloaded.harness.inspection.realtimeSignals.at(-1)).toMatchObject({
+        channel: GOAL_REALTIME_CHANNEL,
+        payload: {
+          threadId: "thr_missed_delete",
+          deleted: true,
+          lifecycle: "deleted",
+        },
+      });
+    } finally {
+      service.controller.abort();
+      await service.done;
+      await reloaded.harness.lifecycle.dispose();
+    }
+  });
+
+  it("accepts official fork creation payloads without copying source state", async () => {
+    const { bb, harness } = fakeHost();
+    await deterministicPlugin()(bb);
+    try {
+      await harness.behavior.callRpc("start", {
+        threadId: "thr_source",
+        objective: "source only",
+      });
+      await harness.behavior.emitThreadEvent("thread.created", {
+        thread: makeThreadResponse({
+          id: "thr_fork",
+          parentThreadId: "thr_source",
+          sourceThreadId: "thr_source",
+          originKind: "fork",
+          environmentId: "env_test",
+        }),
+      });
+      await expect(
+        harness.behavior.callRpc("status", { threadId: "thr_fork" }),
+      ).resolves.toEqual({ goal: null });
+      await expect(
+        harness.behavior.callRpc("status", { threadId: "thr_source" }),
+      ).resolves.toMatchObject({ goal: { objective: "source only", revision: 1 } });
+      const childContext = agentContext("codex");
+      const childConfiguration = await harness.behavior.resolveAgentConfiguration({
+        ...childContext,
+        thread: {
+          ...childContext.thread,
+          id: "thr_fork",
+          parentThreadId: "thr_source",
+          sourceThreadId: "thr_source",
+        },
+        origin: { kind: "fork", pluginId: null },
+      });
+      expect(childConfiguration).toEqual({
+        tools: [],
+        skills: [],
+        instructions: null,
+      });
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
+  it("contains lifecycle handler failures instead of detaching work", async () => {
+    let archivedAt: number | null = 100;
+    const failingPlugin = createPlugin({
+      makeRuntime(database, gateway) {
+        const runtime = makeGoalRuntime(database, gateway);
+        return {
+          ...runtime,
+          archiveThread: async () => {
+            throw new Error("archive transaction failed");
+          },
+        };
+      },
+    });
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "goal",
+      sdk: {
+        threads: {
+          get: async ({ threadId }) => makeThreadResponse({ id: threadId, archivedAt }),
+        },
+      },
+    });
+    await failingPlugin(bb);
+    try {
+      const result = await harness.behavior.emitThreadEvent("thread.archived", {
+        thread: makeThreadResponse({ id: "thr_error", archivedAt }),
+      });
+      expect(result.errors).toEqual([]);
+      expect(harness.inspection.logEntries.at(-1)).toMatchObject({
+        level: "error",
+        message: expect.stringContaining("archive transaction failed"),
+      });
+    } finally {
+      archivedAt = null;
       await harness.lifecycle.dispose();
     }
   });
@@ -1168,6 +1427,9 @@ describe("Goal BB adapter", () => {
           },
           enqueueIdle: runtime.enqueueIdle,
           recordFailure: runtime.recordFailure,
+          archiveThread: runtime.archiveThread,
+          deleteThread: runtime.deleteThread,
+          ownedThreadIds: runtime.ownedThreadIds,
           recoverContinuations: runtime.recoverContinuations,
           assessSettledContinuations: runtime.assessSettledContinuations,
           recoverUsageLimits: runtime.recoverUsageLimits,
@@ -2200,6 +2462,9 @@ describe("Goal BB adapter", () => {
           run: runtime.run,
           enqueueIdle: runtime.enqueueIdle,
           recordFailure: runtime.recordFailure,
+          archiveThread: runtime.archiveThread,
+          deleteThread: runtime.deleteThread,
+          ownedThreadIds: runtime.ownedThreadIds,
           recoverContinuations: runtime.recoverContinuations,
           assessSettledContinuations: runtime.assessSettledContinuations,
           recoverUsageLimits: runtime.recoverUsageLimits,

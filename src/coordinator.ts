@@ -8,6 +8,7 @@ import {
   GoalInvalidCursor,
   GoalInvalidHistoryQuery,
   GoalInvalidObjective,
+  GoalThreadArchived,
   GoalThreadNotFound,
   type GoalCommand,
   type GoalDto,
@@ -46,10 +47,14 @@ export interface GoalThreadSnapshot {
   readonly queuedMessageCount: number;
   readonly activePromptMode: "plan" | null;
   readonly pendingInteractionCount: number;
+  readonly archived?: boolean;
+  readonly deleted?: boolean;
 }
 
 export type GoalContinuationEligibilityReasonCode =
   | "queued-user-message"
+  | "thread-archived"
+  | "thread-deleted"
   | "thread-status"
   | "thread-runtime-status"
   | "plan-mode"
@@ -68,6 +73,18 @@ export interface GoalContinuationEligibility {
 export function goalContinuationEligibility(
   snapshot: GoalThreadSnapshot,
 ): GoalContinuationEligibility {
+  if (snapshot.deleted === true) {
+    return {
+      eligible: false,
+      reason: { code: "thread-deleted", message: "thread is deleted" },
+    };
+  }
+  if (snapshot.archived === true) {
+    return {
+      eligible: false,
+      reason: { code: "thread-archived", message: "thread is archived" },
+    };
+  }
   if (snapshot.queuedMessageCount > 0) {
     return {
       eligible: false,
@@ -118,6 +135,13 @@ export function goalContinuationEligibility(
 
 export interface GoalThreadGatewayAdapter {
   readonly threadExists: (threadId: string) => Promise<boolean>;
+  readonly readThreadOwnership?: (
+    threadId: string,
+  ) => Promise<{
+    readonly exists: boolean;
+    readonly archived: boolean;
+    readonly deleted: boolean;
+  }>;
   readonly readThread?: (
     threadId: string,
     signal?: AbortSignal,
@@ -157,6 +181,12 @@ interface GoalThreadGatewayService {
     threadId: string,
     signal?: AbortSignal,
   ) => Effect.Effect<GoalThreadSnapshot, GoalGatewayError>;
+  readonly requireUnarchivedThread: (
+    threadId: string,
+  ) => Effect.Effect<
+    void,
+    GoalThreadArchived | GoalThreadNotFound | GoalGatewayError
+  >;
   readonly sendContinuation: (
     threadId: string,
     deliveryMarker: string,
@@ -213,6 +243,34 @@ export function makeGoalThreadGatewayLayer(
           });
         },
       ),
+      requireUnarchivedThread: Effect.fn(
+        "GoalThreadGateway.requireUnarchivedThread",
+      )(function* (threadId: string) {
+        if (adapter.readThreadOwnership === undefined) {
+          const exists = yield* Effect.tryPromise({
+            try: () => adapter.threadExists(threadId),
+            catch: (cause) =>
+              new GoalGatewayError({
+                message: `Could not inspect thread ${threadId}: ${cause instanceof Error ? cause.message : String(cause)}`,
+              }),
+          });
+          if (!exists) return yield* new GoalThreadNotFound({ threadId });
+          return;
+        }
+        const thread = yield* Effect.tryPromise({
+          try: () => adapter.readThreadOwnership!(threadId),
+          catch: (cause) =>
+            new GoalGatewayError({
+              message: `Could not read thread ${threadId}: ${cause instanceof Error ? cause.message : String(cause)}`,
+            }),
+        });
+        if (!thread.exists || thread.deleted === true) {
+          return yield* new GoalThreadNotFound({ threadId });
+        }
+        if (thread.archived === true) {
+          return yield* new GoalThreadArchived({ threadId });
+        }
+      }),
       sendContinuation: Effect.fn("GoalThreadGateway.sendContinuation")(
         function* (
           threadId: string,
@@ -323,6 +381,11 @@ interface GoalCoordinatorService {
   readonly execute: (
     command: GoalCommand,
   ) => Effect.Effect<GoalCoordinatorResult, GoalError>;
+  readonly archiveThread: (
+    threadId: string,
+  ) => Effect.Effect<GoalDto | null, GoalError>;
+  readonly deleteThread: (threadId: string) => Effect.Effect<void, GoalError>;
+  readonly ownedThreadIds: () => Effect.Effect<readonly string[], GoalError>;
 }
 
 export class GoalCoordinator extends Context.Service<
@@ -343,7 +406,17 @@ export class GoalCoordinator extends Context.Service<
             return { goal: yield* repository.find(command.goalId) };
           }
 
-          yield* gateway.requireThread(command.threadId);
+          if (
+            command.type === "start" ||
+            command.type === "resume" ||
+            command.type === "complete" ||
+            command.type === "block" ||
+            command.type === "failure"
+          ) {
+            yield* gateway.requireUnarchivedThread(command.threadId);
+          } else {
+            yield* gateway.requireThread(command.threadId);
+          }
 
           if (command.type === "status") {
             return { goal: yield* repository.current(command.threadId) };
@@ -484,7 +557,29 @@ export class GoalCoordinator extends Context.Service<
         },
       );
 
-      return GoalCoordinator.of({ execute });
+      const archiveThread = Effect.fn("GoalCoordinator.archiveThread")(
+        function* (threadId: string) {
+          return yield* repository.archiveThread({
+            threadId,
+            now: yield* clock.nowIso,
+          });
+        },
+      );
+
+      const deleteThread = Effect.fn("GoalCoordinator.deleteThread")(
+        (threadId: string) => repository.deleteThread(threadId),
+      );
+
+      const ownedThreadIds = Effect.fn("GoalCoordinator.ownedThreadIds")(() =>
+        repository.ownedThreadIds(),
+      );
+
+      return GoalCoordinator.of({
+        execute,
+        archiveThread,
+        deleteThread,
+        ownedThreadIds,
+      });
     }),
   );
 }
@@ -609,6 +704,22 @@ export class GoalContinuationCoordinator extends Context.Service<
         const changed: GoalDto[] = [];
         for (const continuation of continuations) {
           if (signal?.aborted === true) break;
+          const thread = yield* gateway.readThread(
+            continuation.threadId,
+            signal,
+          );
+          if (thread.deleted === true) {
+            yield* repository.deleteThread(continuation.threadId);
+            continue;
+          }
+          if (thread.archived === true) {
+            const goal = yield* repository.archiveThread({
+              threadId: continuation.threadId,
+              now: yield* clock.nowIso,
+            });
+            if (goal !== null) changed.push(goal);
+            continue;
+          }
           const deliveryMarker =
             continuation.deliveryMarker ??
             goalContinuationMarker(continuation.id);

@@ -170,6 +170,11 @@ export interface DeleteGoalRecord {
   readonly expectedRevision: number;
 }
 
+export interface ArchiveGoalThreadRecord {
+  readonly threadId: string;
+  readonly now: string;
+}
+
 type GoalMutationError =
   | GoalNotFound
   | GoalStaleGuard
@@ -289,6 +294,16 @@ interface GoalRepositoryService {
   readonly delete: (
     record: DeleteGoalRecord,
   ) => Effect.Effect<GoalDto, GoalDeleteError>;
+  readonly archiveThread: (
+    record: ArchiveGoalThreadRecord,
+  ) => Effect.Effect<GoalDto | null, GoalPersistenceError>;
+  readonly deleteThread: (
+    threadId: string,
+  ) => Effect.Effect<void, GoalPersistenceError>;
+  readonly ownedThreadIds: () => Effect.Effect<
+    readonly string[],
+    GoalPersistenceError
+  >;
   readonly enqueueContinuation: (
     record: EnqueueGoalContinuationRecord,
   ) => Effect.Effect<GoalContinuationRecord | null, GoalPersistenceError>;
@@ -689,6 +704,57 @@ export function makeGoalRepositoryLayer(
       const deleteHistoryOrder = database.prepare(
         `DELETE FROM goal_history_order WHERE goal_id = ?`,
       );
+      const archiveUnfinishedGoal = database.prepare(
+        `UPDATE goals
+          SET state = 'paused', revision = revision + 1, updated_at = ?,
+            pause_reason_code = 'archived',
+            pause_reason = 'Paused because the owning thread was archived',
+            usage_limit_kind = NULL, usage_reset_at = NULL
+          WHERE thread_id = ? AND state IN ('active', 'waiting')
+            AND finished_at IS NULL`,
+      );
+      const releaseThreadContinuations = database.prepare(
+        `UPDATE goal_continuations
+          SET state = 'resolved', outcome = 'released', lease_expires_at = NULL,
+            outcome_reason = 'Owning thread archived', updated_at = ?
+          WHERE thread_id = ? AND state IN ('pending', 'claimed', 'sending')`,
+      );
+      const neutralizeThreadAssessments = database.prepare(
+        `UPDATE goal_continuations
+          SET progress_assessed_at = ?,
+            progress_evidence_json = '{"assessment":"ignored","reason":"Owning thread archived"}',
+            updated_at = ?
+          WHERE thread_id = ? AND state = 'resolved' AND outcome = 'sent'
+            AND progress_assessed_at IS NULL`,
+      );
+      const deleteThreadGoals = database.prepare(
+        `DELETE FROM goals WHERE thread_id = ?`,
+      );
+      const deleteThreadHistoryOrder = database.prepare(
+        `DELETE FROM goal_history_order WHERE thread_id = ?`,
+      );
+      const deleteThreadHistoryCounter = database.prepare(
+        `DELETE FROM goal_history_counters WHERE thread_id = ?`,
+      );
+      const deleteThreadBlockageQualifications = database.prepare(
+        `DELETE FROM goal_blockage_qualifications WHERE thread_id = ?`,
+      );
+      const deleteThreadContinuations = database.prepare(
+        `DELETE FROM goal_continuations WHERE thread_id = ?`,
+      );
+      const deleteThreadFailureEvents = database.prepare(
+        `DELETE FROM goal_failure_events WHERE thread_id = ?`,
+      );
+      const selectOwnedThreadIds = database.prepare<
+        [],
+        { readonly threadId: string }
+      >(`SELECT thread_id AS threadId FROM goals
+        UNION SELECT thread_id FROM goal_history_order
+        UNION SELECT thread_id FROM goal_history_counters
+        UNION SELECT thread_id FROM goal_blockage_qualifications
+        UNION SELECT thread_id FROM goal_continuations
+        UNION SELECT thread_id FROM goal_failure_events
+        ORDER BY threadId`);
       const continuationColumns = `SELECT
           id,
           thread_id AS threadId,
@@ -1275,6 +1341,28 @@ export function makeGoalRepositoryLayer(
         },
       );
 
+      const archiveThreadTransaction = database.transaction(
+        (record: ArchiveGoalThreadRecord): GoalDto | null => {
+          archiveUnfinishedGoal.run(record.now, record.threadId);
+          releaseThreadContinuations.run(record.now, record.threadId);
+          neutralizeThreadAssessments.run(
+            record.now,
+            record.now,
+            record.threadId,
+          );
+          return readCurrent(record.threadId);
+        },
+      );
+
+      const deleteThreadTransaction = database.transaction((threadId: string) => {
+        deleteThreadContinuations.run(threadId);
+        deleteThreadBlockageQualifications.run(threadId);
+        deleteThreadFailureEvents.run(threadId);
+        deleteThreadHistoryOrder.run(threadId);
+        deleteThreadHistoryCounter.run(threadId);
+        deleteThreadGoals.run(threadId);
+      });
+
       const current = Effect.fn("GoalRepository.current")((threadId: string) =>
         Effect.try({
           try: () => readCurrent(threadId),
@@ -1586,6 +1674,38 @@ export function makeGoalRepositoryLayer(
           }),
       );
 
+      const archiveThread = Effect.fn("GoalRepository.archiveThread")(
+        (record: ArchiveGoalThreadRecord) =>
+          Effect.try({
+            try: () => archiveThreadTransaction(record),
+            catch: (cause) =>
+              new GoalPersistenceError({
+                message: `Could not archive thread Goal state: ${messageFromCause(cause)}`,
+              }),
+          }),
+      );
+
+      const deleteThread = Effect.fn("GoalRepository.deleteThread")(
+        (threadId: string) =>
+          Effect.try({
+            try: () => deleteThreadTransaction(threadId),
+            catch: (cause) =>
+              new GoalPersistenceError({
+                message: `Could not delete thread Goal state: ${messageFromCause(cause)}`,
+              }),
+          }),
+      );
+
+      const ownedThreadIds = Effect.fn("GoalRepository.ownedThreadIds")(() =>
+        Effect.try({
+          try: () => selectOwnedThreadIds.all().map((row) => row.threadId),
+          catch: (cause) =>
+            new GoalPersistenceError({
+              message: `Could not list thread-owned Goal state: ${messageFromCause(cause)}`,
+            }),
+        }),
+      );
+
       return GoalRepository.of({
         current,
         history,
@@ -1593,6 +1713,9 @@ export function makeGoalRepositoryLayer(
         start,
         mutate,
         delete: deleteGoal,
+        archiveThread,
+        deleteThread,
+        ownedThreadIds,
         recordFailure: recordFailureEffect,
         dueUsageLimits,
         recoverUsageLimit: recoverUsageLimitEffect,

@@ -32,6 +32,11 @@ function makeFixture(
   existingThreads: readonly string[] = ["thr_one"],
   options: {
     readonly readThread?: () => Promise<GoalThreadSnapshot>;
+    readonly readThreadOwnership?: () => Promise<{
+      readonly exists: boolean;
+      readonly archived: boolean;
+      readonly deleted: boolean;
+    }>;
     readonly nowIso?: () => string;
     readonly observeContinuation?: (
       marker: string,
@@ -48,6 +53,7 @@ function makeFixture(
     database,
     {
       threadExists: async (threadId) => existingThreads.includes(threadId),
+      readThreadOwnership: options.readThreadOwnership,
       readThread: options.readThread ?? (async () => idleThreadSnapshot),
       sendContinuation: async (_threadId, marker) => {
         continuationSends += 1;
@@ -2187,6 +2193,235 @@ describe("Goal coordinator", () => {
     } finally {
       if (fixture.database.open) fixture.database.close();
       rmSync(fixture.directory, { recursive: true, force: true });
+    }
+  });
+
+  it("archives unfinished Goals atomically and is idempotent across duplicate delivery", async () => {
+    const fixture = makeFixture(["thr_active", "thr_waiting", "thr_manual", "thr_terminal"]);
+    try {
+      await fixture.runtime.run({ type: "start", threadId: "thr_active", objective: "active work" });
+      await fixture.runtime.enqueueIdle("thr_active", "sent-before-archive");
+      await fixture.runtime.processContinuation(new AbortController().signal);
+      await fixture.runtime.enqueueIdle("thr_active", "pending-before-archive");
+      await fixture.runtime.enqueueIdle("thr_active", "claimed-before-archive");
+      await fixture.runtime.enqueueIdle("thr_active", "sending-before-archive");
+      fixture.database
+        .prepare("UPDATE goal_continuations SET state = 'claimed' WHERE opportunity_key = ?")
+        .run("claimed-before-archive");
+      fixture.database
+        .prepare("UPDATE goal_continuations SET state = 'sending' WHERE opportunity_key = ?")
+        .run("sending-before-archive");
+
+      const archived = await fixture.runtime.archiveThread("thr_active");
+      expect(archived).toMatchObject({
+        state: "paused",
+        revision: 2,
+        pauseReasonCode: "archived",
+        pauseReason: "Paused because the owning thread was archived",
+      });
+      expect(
+        fixture.database
+          .prepare("SELECT state, outcome, progress_assessed_at AS assessedAt FROM goal_continuations WHERE thread_id = ? ORDER BY opportunity_key")
+          .all("thr_active"),
+      ).toEqual([
+        { state: "resolved", outcome: "released", assessedAt: null },
+        { state: "resolved", outcome: "released", assessedAt: null },
+        { state: "resolved", outcome: "released", assessedAt: null },
+        { state: "resolved", outcome: "sent", assessedAt: "2026-08-22T12:00:00.000Z" },
+      ]);
+
+      await expect(fixture.runtime.archiveThread("thr_active")).resolves.toMatchObject({
+        revision: 2,
+        pauseReasonCode: "archived",
+      });
+
+      await fixture.runtime.run({ type: "start", threadId: "thr_waiting", objective: "wait" });
+      await fixture.runtime.recordFailure("thr_waiting", {
+        kind: "usage-limit",
+        limitKind: "subscription-window",
+        reason: "window exhausted",
+        resetAt: "2026-08-22T12:10:00.000Z",
+      });
+      await expect(fixture.runtime.archiveThread("thr_waiting")).resolves.toMatchObject({
+        state: "paused",
+        revision: 3,
+        pauseReasonCode: "archived",
+        usageResetAt: null,
+      });
+
+      await fixture.runtime.run({ type: "start", threadId: "thr_manual", objective: "manual" });
+      await fixture.runtime.run({
+        type: "pause",
+        threadId: "thr_manual",
+        goalId: "goal_7",
+        expectedRevision: 1,
+      });
+      await expect(fixture.runtime.archiveThread("thr_manual")).resolves.toMatchObject({
+        state: "paused",
+        revision: 2,
+        pauseReasonCode: "manual",
+      });
+
+      await fixture.runtime.run({ type: "start", threadId: "thr_terminal", objective: "finish" });
+      await fixture.runtime.run({
+        type: "complete",
+        threadId: "thr_terminal",
+        goalId: "goal_8",
+        expectedRevision: 1,
+        summary: "finished",
+        verificationEvidence: "tests pass",
+      });
+      await expect(fixture.runtime.archiveThread("thr_terminal")).resolves.toBeNull();
+      await expect(
+        fixture.runtime.run({ type: "show", goalId: "goal_8" }),
+      ).resolves.toMatchObject({ ok: true, goal: { state: "completed", revision: 2 } });
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("keeps archive-paused Goals inert until an authoritative explicit resume", async () => {
+    let archived = false;
+    const fixture = makeFixture(["thr_one"], {
+      readThread: async () => ({ ...idleThreadSnapshot, archived }),
+      readThreadOwnership: async () => ({ exists: true, archived, deleted: false }),
+    });
+    try {
+      await fixture.runtime.run({ type: "start", threadId: "thr_one", objective: "resume safely" });
+      archived = true;
+      const paused = await fixture.runtime.archiveThread("thr_one");
+      const rejected = await fixture.runtime.run({
+        type: "resume",
+        threadId: "thr_one",
+        goalId: "goal_1",
+        expectedRevision: paused!.revision,
+      });
+      expect(rejected).toEqual({
+        ok: false,
+        error: {
+          code: "thread_archived",
+          message: "Thread thr_one is archived. Unarchive it before starting or resuming a Goal.",
+        },
+      });
+      await expect(
+        fixture.runtime.run({ type: "status", threadId: "thr_one" }),
+      ).resolves.toMatchObject({ ok: true, goal: { state: "paused", revision: 2 } });
+
+      archived = false;
+      await expect(
+        fixture.runtime.run({
+          type: "resume",
+          threadId: "thr_one",
+          goalId: "goal_1",
+          expectedRevision: 2,
+        }),
+      ).resolves.toMatchObject({ ok: true, goal: { state: "active", revision: 3 } });
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("blocks delivery when archive wins after a Continuation claim", async () => {
+    let reads = 0;
+    const fixture = makeFixture(["thr_one"], {
+      readThread: async () => ({ ...idleThreadSnapshot, archived: ++reads >= 2 }),
+    });
+    try {
+      await fixture.runtime.run({ type: "start", threadId: "thr_one", objective: "race safely" });
+      reads = 0;
+      await fixture.runtime.enqueueIdle("thr_one", "archive-race");
+      await fixture.runtime.processContinuation(new AbortController().signal);
+      expect(fixture.continuationSends()).toBe(0);
+      expect(
+        fixture.database
+          .prepare("SELECT state, outcome, outcome_reason AS reason FROM goal_continuations WHERE opportunity_key = ?")
+          .get("archive-race"),
+      ).toMatchObject({
+        state: "resolved",
+        outcome: "released",
+        reason: "Suspended immediately before send: thread is archived",
+      });
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("deletes every thread-owned row in one idempotent transaction", async () => {
+    const fixture = makeFixture();
+    const tables = [
+      "goals",
+      "goal_history_order",
+      "goal_history_counters",
+      "goal_blockage_qualifications",
+      "goal_continuations",
+      "goal_failure_events",
+    ] as const;
+    try {
+      await fixture.runtime.run({ type: "start", threadId: "thr_one", objective: "owned state" });
+      await fixture.runtime.run({
+        type: "block",
+        threadId: "thr_one",
+        goalId: "goal_1",
+        expectedRevision: 1,
+        externalAction: "Provision the missing signing key",
+        evidence: "key lookup failed",
+        repeatedTurns: 1,
+      });
+      await fixture.runtime.enqueueIdle("thr_one", "delete-me");
+      await fixture.runtime.recordFailure(
+        "thr_one",
+        {
+          kind: "usage-limit",
+          limitKind: "subscription-window",
+          reason: "window exhausted",
+          resetAt: "2026-08-22T12:00:00.000Z",
+        },
+        { id: "failure-delete", seq: 9, createdAt: 1, turnId: "turn-delete" },
+      );
+      for (const table of tables) {
+        expect(
+          fixture.database
+            .prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE thread_id = ?`)
+            .get("thr_one"),
+        ).not.toEqual({ count: 0 });
+      }
+
+      await fixture.runtime.deleteThread("thr_one");
+      await fixture.runtime.deleteThread("thr_one");
+      for (const table of tables) {
+        expect(
+          fixture.database.prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE thread_id = ?`).get("thr_one"),
+        ).toEqual({ count: 0 });
+      }
+      await expect(fixture.runtime.recoverUsageLimits()).resolves.toEqual([]);
+      await expect(fixture.runtime.assessSettledContinuations()).resolves.toEqual([]);
+      await expect(
+        fixture.runtime.run({ type: "history", threadId: "thr_one", limit: 20, cursor: null }),
+      ).resolves.toEqual({ ok: true, page: { goals: [], nextCursor: null } });
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("keeps official fork children isolated from source Goal state", async () => {
+    const fixture = makeFixture(["thr_source", "thr_fork"]);
+    try {
+      await fixture.runtime.run({ type: "start", threadId: "thr_source", objective: "source objective" });
+      await fixture.runtime.enqueueIdle("thr_source", "source-only");
+      await expect(
+        fixture.runtime.run({ type: "status", threadId: "thr_fork" }),
+      ).resolves.toEqual({ ok: true, goal: null });
+      await expect(
+        fixture.runtime.run({ type: "history", threadId: "thr_fork", limit: 20, cursor: null }),
+      ).resolves.toEqual({ ok: true, page: { goals: [], nextCursor: null } });
+      expect(
+        fixture.database.prepare("SELECT COUNT(*) AS count FROM goal_continuations WHERE thread_id = ?").get("thr_fork"),
+      ).toEqual({ count: 0 });
+      await expect(
+        fixture.runtime.run({ type: "status", threadId: "thr_source" }),
+      ).resolves.toMatchObject({ ok: true, goal: { objective: "source objective", revision: 1 } });
+    } finally {
+      await fixture.close();
     }
   });
 

@@ -287,6 +287,82 @@ describe("Goal composer row", () => {
     }
   });
 
+  it("refreshes archive state and clears composer and history on a deletion tombstone", async () => {
+    let current: Goal | null = activeGoal;
+    let goals: Goal[] = [activeGoal];
+    let deleted = false;
+    const rpc: RpcHandlers = {
+      ...handlers(current),
+      status: () => {
+        if (deleted) throw new Error("thread not found");
+        return { goal: current };
+      },
+      history: () => {
+        if (deleted) throw new Error("thread not found");
+        return { goals, nextCursor: null };
+      },
+    };
+    const composer = renderSlot<{}, typeof rpcContract>(goalBanner(), {}, {
+      context: { threadId: "thr_ui", projectId: "proj_ui" },
+      rpc,
+    });
+    const panel = renderSlot<
+      { threadId: string; params: JsonValue | null },
+      typeof rpcContract
+    >(
+      historyPanel(),
+      { threadId: "thr_ui", params: null },
+      { rpc },
+    );
+    try {
+      expect(await composer.findByText("Active Goal")).toBeTruthy();
+      expect(await panel.findAllByText(activeGoal.objective)).not.toHaveLength(0);
+
+      current = {
+        ...activeGoal,
+        state: "paused",
+        revision: 2,
+        pauseReasonCode: "archived",
+        pauseReason: "Paused because the owning thread was archived",
+      };
+      goals = [current];
+      const archiveSignal = {
+        threadId: "thr_ui",
+        lifecycle: "archived",
+        pauseReasonCode: "archived",
+      };
+      await composer.behavior.emitRealtime("goal.changed", archiveSignal);
+      await panel.behavior.emitRealtime("goal.changed", archiveSignal);
+      expect(
+        await composer.findAllByText(/Paused because the owning thread was archived/),
+      ).not.toHaveLength(0);
+      expect(
+        await panel.findAllByText("Paused because the owning thread was archived"),
+      ).not.toHaveLength(0);
+
+      current = null;
+      goals = [];
+      deleted = true;
+      const tombstone = {
+        threadId: "thr_ui",
+        goalId: null,
+        deleted: true,
+        lifecycle: "deleted",
+      };
+      await composer.behavior.emitRealtime("goal.changed", tombstone);
+      await panel.behavior.emitRealtime("goal.changed", tombstone);
+      expect(
+        await composer.findByRole("button", { name: "Start Goal" }),
+      ).toBeTruthy();
+      expect(
+        await panel.findByText("No Goals have been recorded for this thread."),
+      ).toBeTruthy();
+    } finally {
+      composer.lifecycle.unmount();
+      panel.lifecycle.unmount();
+    }
+  });
+
   it("paginates panel history, confirms exact deletion, and refreshes realtime", async () => {
     const historical: Goal = {
       ...activeGoal,

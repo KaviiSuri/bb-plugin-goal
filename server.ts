@@ -54,7 +54,7 @@ const goalSchema = z
     blockageEvidence: z.string().nullable(),
     blockageRepeatedTurns: z.number().int().nullable(),
     pauseReasonCode: z
-      .enum(["manual", "failure", "usage-limit", "no-progress"])
+      .enum(["manual", "archived", "failure", "usage-limit", "no-progress"])
       .nullable(),
     pauseReason: z.string().nullable(),
     usageLimitKind: z
@@ -269,6 +269,7 @@ function resultExitCode(result: GoalCommandResult): number {
     case "goal_already_exists":
     case "stale_goal":
     case "invalid_transition":
+    case "thread_archived":
       return 4;
     case "persistence_error":
     case "gateway_error":
@@ -587,6 +588,28 @@ function publishGoalChanged(
     noProgressEvidence: goal.noProgressEvidence,
     deleted,
   });
+}
+
+function publishThreadInvalidation(
+  bb: BbPluginApi,
+  threadId: string,
+  lifecycle: "archived" | "deleted",
+): void {
+  bb.realtime.publish(GOAL_REALTIME_CHANNEL, {
+    threadId,
+    goalId: null,
+    revision: null,
+    state: null,
+    pauseReasonCode: lifecycle === "archived" ? "archived" : null,
+    noProgressConsecutiveCount: null,
+    noProgressEvidence: null,
+    deleted: lifecycle === "deleted",
+    lifecycle,
+  });
+}
+
+function isThreadMissingError(cause: unknown): boolean {
+  return cause instanceof Error && /(?:not found|\b404\b)/i.test(cause.message);
 }
 
 async function runStart(
@@ -1074,16 +1097,38 @@ export function createPlugin(
     const runtime = dependencies.makeRuntime(database, {
       async threadExists(threadId) {
         try {
-          await bb.sdk.threads.get({ threadId });
-          return true;
+          const thread = await bb.sdk.threads.get({ threadId });
+          return thread.deletedAt === null;
         } catch {
           return false;
         }
       },
+      async readThreadOwnership(threadId) {
+        try {
+          const thread = await bb.sdk.threads.get({ threadId });
+          return {
+            exists: thread.deletedAt === null,
+            archived: thread.archivedAt !== null,
+            deleted: thread.deletedAt !== null,
+          };
+        } catch {
+          return { exists: false, archived: false, deleted: true };
+        }
+      },
       async readThread(threadId, signal) {
-        const [thread, queuedMessages, interactions, timeline] =
-          await Promise.all([
-            bb.sdk.threads.get({ threadId, signal }),
+        const thread = await bb.sdk.threads.get({ threadId, signal });
+        if (thread.archivedAt !== null || thread.deletedAt !== null) {
+          return {
+            status: thread.status,
+            runtimeStatus: thread.runtime.displayStatus,
+            queuedMessageCount: 0,
+            activePromptMode: null,
+            pendingInteractionCount: 0,
+            archived: thread.archivedAt !== null,
+            deleted: thread.deletedAt !== null,
+          };
+        }
+        const [queuedMessages, interactions, timeline] = await Promise.all([
             bb.sdk.threads.queuedMessages.list({ threadId, signal }),
             bb.sdk.threads.interactions.list({ threadId, signal }),
             bb.sdk.threads.timeline({
@@ -1103,11 +1148,17 @@ export function createPlugin(
               interaction.status !== "resolved" &&
               interaction.status !== "interrupted",
           ).length,
+          archived: false,
+          deleted: false,
         };
       },
       async sendContinuation(threadId, deliveryMarker, signal) {
         if (signal?.aborted === true) {
           throw new Error("Goal plugin is shutting down.");
+        }
+        const thread = await bb.sdk.threads.get({ threadId, signal });
+        if (thread.archivedAt !== null || thread.deletedAt !== null) {
+          throw new Error("The owning thread is archived or deleted.");
         }
         await bb.sdk.threads.send({
           threadId,
@@ -1147,22 +1198,36 @@ export function createPlugin(
     const CONTINUATION_RETRY_MAX_MS = 1_000;
     let disposed = false;
     let wakeWorker: (() => void) | null = null;
+    let wakePending = false;
     const pendingIdleEvents = new Map<
       string,
       { readonly threadId: string; readonly opportunityKey: string }
     >();
     const pendingIdleEventKey = (threadId: string, opportunityKey: string) =>
       `${threadId}\u0000${opportunityKey}`;
+    const clearPendingIdleEvents = (threadId: string) => {
+      for (const [key, event] of pendingIdleEvents) {
+        if (event.threadId === threadId) pendingIdleEvents.delete(key);
+      }
+    };
     const wake = () => {
       const resolve = wakeWorker;
+      if (resolve === null) {
+        wakePending = true;
+        return;
+      }
       wakeWorker = null;
-      resolve?.();
+      resolve();
     };
     const waitForWork = (
       signal: AbortSignal,
       timeoutMs: number | null = null,
     ): Promise<void> => {
       if (signal.aborted) return Promise.resolve();
+      if (wakePending) {
+        wakePending = false;
+        return Promise.resolve();
+      }
       return new Promise((resolve) => {
         let timer: ReturnType<typeof setTimeout> | undefined;
         const finish = () => {
@@ -1184,6 +1249,36 @@ export function createPlugin(
         for (const goal of assessed) publishGoalChanged(bb, goal);
         await runtime.enqueueIdle(event.threadId, event.opportunityKey);
         pendingIdleEvents.delete(pendingKey);
+      }
+    };
+
+    const reconcileThreadOwnership = async () => {
+      for (const threadId of await runtime.ownedThreadIds()) {
+        let thread;
+        try {
+          thread = await bb.sdk.threads.get({ threadId });
+        } catch (cause) {
+          if (!isThreadMissingError(cause)) throw cause;
+          clearPendingIdleEvents(threadId);
+          await runtime.deleteThread(threadId);
+          publishThreadInvalidation(bb, threadId, "deleted");
+          continue;
+        }
+        if (thread.deletedAt !== null) {
+          clearPendingIdleEvents(threadId);
+          await runtime.deleteThread(threadId);
+          publishThreadInvalidation(bb, threadId, "deleted");
+          continue;
+        }
+        if (thread.archivedAt !== null) {
+          clearPendingIdleEvents(threadId);
+          const goal = await runtime.archiveThread(threadId);
+          if (goal === null) {
+            publishThreadInvalidation(bb, threadId, "archived");
+          } else {
+            publishGoalChanged(bb, goal);
+          }
+        }
       }
     };
 
@@ -1209,6 +1304,71 @@ export function createPlugin(
           }`,
         );
         wake();
+      }
+    });
+
+    bb.events.on("thread.created", async () => {
+      // Creation and fork events are observe-only. Goal state remains keyed by
+      // the new thread ID, so source data is never copied or inferred.
+    });
+
+    bb.events.on("thread.archived", async ({ thread: observedThread }) => {
+      if (disposed) return;
+      try {
+        const thread = await bb.sdk.threads.get({ threadId: observedThread.id });
+        if (thread.deletedAt !== null) {
+          clearPendingIdleEvents(thread.id);
+          await runtime.deleteThread(thread.id);
+          publishThreadInvalidation(bb, thread.id, "deleted");
+          wake();
+          return;
+        }
+        if (thread.archivedAt === null) return;
+        clearPendingIdleEvents(thread.id);
+        const goal = await runtime.archiveThread(thread.id);
+        if (goal === null) {
+          publishThreadInvalidation(bb, thread.id, "archived");
+        } else {
+          publishGoalChanged(bb, goal);
+        }
+        wake();
+      } catch (cause) {
+        if (isThreadMissingError(cause)) {
+          try {
+            clearPendingIdleEvents(observedThread.id);
+            await runtime.deleteThread(observedThread.id);
+            publishThreadInvalidation(bb, observedThread.id, "deleted");
+            wake();
+          } catch (cleanupCause) {
+            if (!disposed) {
+              bb.log.error(
+                `Could not delete Goal state after archive reconciliation: ${cleanupCause instanceof Error ? cleanupCause.message : String(cleanupCause)}`,
+              );
+            }
+          }
+          return;
+        }
+        if (!disposed) {
+          bb.log.error(
+            `Could not archive Goal state: ${cause instanceof Error ? cause.message : String(cause)}`,
+          );
+        }
+      }
+    });
+
+    bb.events.on("thread.deleted", async ({ thread }) => {
+      if (disposed) return;
+      try {
+        clearPendingIdleEvents(thread.id);
+        await runtime.deleteThread(thread.id);
+        publishThreadInvalidation(bb, thread.id, "deleted");
+        wake();
+      } catch (cause) {
+        if (!disposed) {
+          bb.log.error(
+            `Could not delete Goal state: ${cause instanceof Error ? cause.message : String(cause)}`,
+          );
+        }
       }
     });
 
@@ -1243,8 +1403,13 @@ export function createPlugin(
     bb.background.service("continuations", {
       async start(signal) {
         let retryDelayMs = CONTINUATION_RETRY_BASE_MS;
+        let ownershipReconciled = false;
         while (!signal.aborted) {
           try {
+            if (!ownershipReconciled) {
+              await reconcileThreadOwnership();
+              ownershipReconciled = true;
+            }
             await retryPendingIdleEvents(signal);
             const recoveredGoals = await runtime.recoverUsageLimits();
             for (const goal of recoveredGoals) {

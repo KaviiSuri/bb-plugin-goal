@@ -44,6 +44,7 @@ interface GoalView {
   readonly blockageRepeatedTurns: number | null;
   readonly pauseReasonCode:
     | "manual"
+    | "archived"
     | "failure"
     | "usage-limit"
     | "no-progress"
@@ -148,6 +149,12 @@ export function GoalHistoryPanel({ threadId }: { readonly threadId: string }) {
       "threadId" in payload &&
       payload.threadId === threadId
     ) {
+      if ("deleted" in payload && payload.deleted === true) {
+        setView({ kind: "ready", goals: [], nextCursor: null });
+        setConfirming(null);
+        setActionError(null);
+        return;
+      }
       void load();
     }
   });
@@ -438,6 +445,12 @@ export function GoalComposerRow() {
       "threadId" in payload &&
       payload.threadId === threadId
     ) {
+      if ("deleted" in payload && payload.deleted === true) {
+        setView({ kind: "empty" });
+        setActionError(null);
+        setEditing(false);
+        return;
+      }
       void load();
     }
   });

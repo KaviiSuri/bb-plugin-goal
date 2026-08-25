@@ -16,6 +16,7 @@ export type GoalMutationType = (typeof goalMutationTypes)[number];
 
 export const goalPauseReasonCodes = [
   "manual",
+  "archived",
   "failure",
   "usage-limit",
   "no-progress",
@@ -265,6 +266,11 @@ export class GoalThreadNotFound extends Schema.TaggedError<GoalThreadNotFound>()
   { threadId: Schema.String },
 ) {}
 
+export class GoalThreadArchived extends Schema.TaggedError<GoalThreadArchived>()(
+  "GoalThreadArchived",
+  { threadId: Schema.String },
+) {}
+
 export class GoalRecordNotFound extends Schema.TaggedError<GoalRecordNotFound>()(
   "GoalRecordNotFound",
   { goalId: Schema.String },
@@ -311,6 +317,7 @@ export type GoalError =
   | GoalStaleGuard
   | GoalInvalidTransition
   | GoalThreadNotFound
+  | GoalThreadArchived
   | GoalRecordNotFound
   | GoalInvalidCursor
   | GoalInvalidHistoryQuery
@@ -326,6 +333,7 @@ export type GoalErrorCode =
   | "stale_goal"
   | "invalid_transition"
   | "thread_not_found"
+  | "thread_archived"
   | "invalid_cursor"
   | "invalid_arguments"
   | "invalid_objective"
@@ -370,6 +378,11 @@ export function goalErrorToDto(error: GoalError): GoalErrorDto {
       return {
         code: "thread_not_found",
         message: `Thread ${error.threadId} was not found.`,
+      };
+    case "GoalThreadArchived":
+      return {
+        code: "thread_archived",
+        message: `Thread ${error.threadId} is archived. Unarchive it before starting or resuming a Goal.`,
       };
     case "GoalRecordNotFound":
       return {
