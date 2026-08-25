@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { classifyGoalFailure } from "./failure";
+import {
+  classifyGoalFailure,
+  classifyGoalFailureWithIdentity,
+} from "./failure";
 
 describe("structured Goal failure classification", () => {
   it("uses a structured subscription window reset and ignores failure prose", () => {
@@ -72,6 +75,39 @@ describe("structured Goal failure classification", () => {
       kind: "ordinary",
       source: "provider",
       reason: expect.stringContaining("new ordinary failure"),
+    });
+  });
+
+  it("does not let stale structured history suppress a current fallback failure", () => {
+    expect(
+      classifyGoalFailureWithIdentity(
+        [
+          {
+            id: "stale-rate-limit",
+            seq: 20,
+            createdAt: Date.parse("2026-08-22T12:00:00.000Z"),
+            type: "provider/rateLimits/updated",
+            data: {
+              rateLimits: {
+                kind: "subscription-window",
+                status: "blocked",
+                reachedReason: "stale history",
+                windows: [],
+              },
+            },
+          },
+        ],
+        Date.parse("2026-08-22T12:01:00.000Z"),
+        "current fallback failure",
+        Date.parse("2026-08-22T12:01:00.000Z"),
+      ),
+    ).toEqual({
+      event: null,
+      failure: {
+        kind: "ordinary",
+        source: "turn",
+        reason: "current fallback failure",
+      },
     });
   });
 

@@ -99,7 +99,7 @@ export const GOAL_MIGRATIONS = [
   `CREATE TABLE IF NOT EXISTS goal_failure_events (
     thread_id TEXT NOT NULL,
     event_id TEXT NOT NULL,
-    event_seq INTEGER NOT NULL CHECK (event_seq >= 0),
+    event_seq INTEGER CHECK (event_seq IS NULL OR event_seq >= 0),
     event_created_at INTEGER NOT NULL,
     observed_at TEXT NOT NULL,
     PRIMARY KEY (thread_id, event_id)
@@ -927,6 +927,7 @@ export function makeGoalRepositoryLayer(
           if (record.event !== undefined && !selectedEventWasNew) return current;
           if (
             record.event !== undefined &&
+            record.event.seq !== null &&
             previousMaxEventSeq !== null &&
             record.event.seq <= previousMaxEventSeq
           ) {

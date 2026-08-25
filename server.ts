@@ -29,6 +29,7 @@ import {
   classifyGoalFailureWithIdentity,
   type ClassifiedGoalFailure,
 } from "./src/failure";
+import type { GoalFailureEventIdentity } from "./src/domain";
 
 export const GOAL_REALTIME_CHANNEL = "goal.changed";
 
@@ -782,17 +783,14 @@ async function runCli(
 }
 
 type ThreadFailureClassification = ClassifiedGoalFailure & {
-  readonly observedEvents: ReadonlyArray<{
-    readonly id: string;
-    readonly seq: number;
-    readonly createdAt: number;
-  }>;
+  readonly observedEvents: ReadonlyArray<GoalFailureEventIdentity>;
 };
 
 async function classifyThreadFailure(
   bb: BbPluginApi,
   threadId: string,
   fallbackMessage: string | null,
+  lifecycleCreatedAtMs: number,
   signal?: AbortSignal,
 ): Promise<ThreadFailureClassification> {
   const events = await bb.sdk.threads.events.list({
@@ -809,17 +807,28 @@ async function classifyThreadFailure(
     type: event.type,
     data: event.data,
   }));
+  const lifecycleEvent: GoalFailureEventIdentity = {
+    id: `thread.failed:${threadId}:${lifecycleCreatedAtMs}`,
+    seq: null,
+    createdAt: lifecycleCreatedAtMs,
+  };
+  const classified = classifyGoalFailureWithIdentity(
+    structuredEvents,
+    Date.now(),
+    fallbackMessage,
+    lifecycleCreatedAtMs,
+  );
   return {
-    ...classifyGoalFailureWithIdentity(
-      structuredEvents,
-      Date.now(),
-      fallbackMessage,
-    ),
-    observedEvents: structuredEvents.map(({ id, seq, createdAt }) => ({
-      id,
-      seq,
-      createdAt,
-    })),
+    ...classified,
+    event: classified.event ?? lifecycleEvent,
+    observedEvents: [
+      ...structuredEvents.map(({ id, seq, createdAt }) => ({
+        id,
+        seq,
+        createdAt,
+      })),
+      lifecycleEvent,
+    ],
   };
 }
 
@@ -964,7 +973,12 @@ export function createPlugin(
     bb.events.on("thread.failed", async ({ thread, error }) => {
       if (disposed) return;
       try {
-        const classified = await classifyThreadFailure(bb, thread.id, error);
+        const classified = await classifyThreadFailure(
+          bb,
+          thread.id,
+          error,
+          thread.updatedAt,
+        );
         const goal = await runtime.recordFailure(
           thread.id,
           classified.failure,

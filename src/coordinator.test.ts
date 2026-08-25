@@ -1478,6 +1478,100 @@ describe("Goal coordinator", () => {
     }
   });
 
+  it("does not reapply a duplicate fallback failure after manual resume", async () => {
+    const fixture = makeFixture();
+    const event = {
+      id: "thread.failed:thr_one:1700000000000",
+      seq: null,
+      createdAt: Date.parse("2026-08-22T12:00:01.000Z"),
+    };
+    try {
+      await fixture.runtime.run({
+        type: "start",
+        threadId: "thr_one",
+        objective: "deduplicate fallback failures",
+      });
+      await fixture.runtime.recordFailure(
+        "thr_one",
+        {
+          kind: "ordinary",
+          source: "turn",
+          reason: "fallback failure once",
+        },
+        event,
+        [event],
+      );
+      await fixture.runtime.run({
+        type: "resume",
+        threadId: "thr_one",
+        goalId: "goal_1",
+        expectedRevision: 2,
+      });
+      const duplicate = await fixture.runtime.recordFailure(
+        "thr_one",
+        {
+          kind: "ordinary",
+          source: "turn",
+          reason: "fallback failure once",
+        },
+        event,
+        [event],
+      );
+      expect(duplicate).toMatchObject({ state: "active", revision: 3 });
+      expect(
+        fixture.database
+          .prepare(
+            "SELECT event_id, event_seq FROM goal_failure_events WHERE event_id = ?",
+          )
+          .get(event.id),
+      ).toEqual({ event_id: event.id, event_seq: null });
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("does not pause a replacement Goal for a delayed fallback failure", async () => {
+    const fixture = makeFixture();
+    try {
+      await fixture.runtime.run({
+        type: "start",
+        threadId: "thr_one",
+        objective: "finish the predecessor",
+      });
+      await fixture.runtime.run({
+        type: "cancel",
+        threadId: "thr_one",
+        goalId: "goal_1",
+        expectedRevision: 1,
+      });
+      await fixture.runtime.run({
+        type: "start",
+        threadId: "thr_one",
+        objective: "start a replacement",
+      });
+      const replacement = await fixture.runtime.recordFailure(
+        "thr_one",
+        {
+          kind: "ordinary",
+          source: "turn",
+          reason: "delayed fallback failure",
+        },
+        {
+          id: "thread.failed:thr_one:1699999999000",
+          seq: null,
+          createdAt: Date.parse("2026-08-22T11:59:59.000Z"),
+        },
+      );
+      expect(replacement).toMatchObject({
+        id: "goal_2",
+        state: "active",
+        revision: 1,
+      });
+    } finally {
+      await fixture.close();
+    }
+  });
+
   it("does not reapply a duplicate structured failure after manual resume", async () => {
     const fixture = makeFixture();
     const event = {

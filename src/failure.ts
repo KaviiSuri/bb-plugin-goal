@@ -7,13 +7,14 @@ import {
 } from "./domain";
 
 export interface GoalFailureEvent extends GoalFailureEventIdentity {
+  readonly seq: number;
   readonly type: string;
   readonly data: unknown;
 }
 
 export interface ClassifiedGoalFailure {
   readonly failure: GoalFailure;
-  readonly event: GoalFailureEvent | null;
+  readonly event: GoalFailureEventIdentity | null;
 }
 
 const failureEventTypes = new Set([
@@ -99,8 +100,16 @@ export function classifyGoalFailureWithIdentity(
   events: readonly GoalFailureEvent[],
   nowMs: number,
   fallbackMessage: string | null = null,
+  lifecycleCreatedAtMs: number | null = null,
 ): ClassifiedGoalFailure {
-  const event = latestFailureEvent(events);
+  const structuredEvent = latestFailureEvent(events);
+  const event =
+    fallbackMessage !== null &&
+    lifecycleCreatedAtMs !== null &&
+    structuredEvent !== null &&
+    structuredEvent.createdAt < lifecycleCreatedAtMs
+      ? null
+      : structuredEvent;
   if (event?.type === "provider/rateLimits/updated") {
     const parsedRate = rateLimitsData.safeParse(event.data);
     if (parsedRate.success && parsedRate.data.rateLimits.status === "blocked") {

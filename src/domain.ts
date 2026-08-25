@@ -88,7 +88,7 @@ interface GuardedGoalCommand {
 
 export interface GoalFailureEventIdentity {
   readonly id: string;
-  readonly seq: number;
+  readonly seq: number | null;
   readonly createdAt: number;
 }
 

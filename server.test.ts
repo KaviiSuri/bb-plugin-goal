@@ -305,6 +305,83 @@ describe("Goal BB adapter", () => {
     }
   });
 
+  it("deduplicates an unordered fallback thread.failed lifecycle trigger", async () => {
+    const updatedAt = Date.now() + 1_000;
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "goal",
+      sdk: {
+        threads: {
+          get: async ({ threadId }) =>
+            makeThreadResponse({
+              id: threadId,
+              status: "error",
+              updatedAt,
+              environmentId: "env_test",
+            }),
+          queuedMessages: { list: async () => [] },
+          interactions: { list: async () => [] },
+          timeline: async () => ({ rows: [], activePromptMode: null }),
+          events: { list: async () => [] },
+        },
+      },
+    });
+    await deterministicPlugin()(bb);
+    try {
+      await harness.behavior.callRpc("start", {
+        threadId: "thr_fallback",
+        objective: "deduplicate lifecycle failures",
+      });
+      const failureThread = makeThreadResponse({
+        id: "thr_fallback",
+        status: "error",
+        updatedAt,
+        environmentId: "env_test",
+      });
+      await harness.behavior.emitThreadEvent("thread.failed", {
+        thread: failureThread,
+        error: "current fallback failure",
+      });
+      const database = bb.storage.database();
+      await waitUntil(
+        () =>
+          (
+            database
+              .prepare("SELECT state FROM goals WHERE thread_id = ?")
+              .get("thr_fallback") as { state: string } | undefined
+          )?.state === "paused",
+      );
+      await expect(
+        harness.behavior.callRpc("status", { threadId: "thr_fallback" }),
+      ).resolves.toMatchObject({
+        goal: { state: "paused", pauseReasonCode: "failure" },
+      });
+      const pausedStatus = (await harness.behavior.callRpc("status", {
+        threadId: "thr_fallback",
+      })) as { goal: { id: string; revision: number } };
+      await harness.behavior.callRpc("resume", {
+        threadId: "thr_fallback",
+        goalId: pausedStatus.goal.id,
+        expectedRevision: pausedStatus.goal.revision,
+      });
+      await harness.behavior.emitThreadEvent("thread.failed", {
+        thread: failureThread,
+        error: "current fallback failure",
+      });
+      await expect(
+        harness.behavior.callRpc("status", { threadId: "thr_fallback" }),
+      ).resolves.toMatchObject({
+        goal: { state: "active", revision: 3 },
+      });
+      expect(
+        database
+          .prepare("SELECT event_seq FROM goal_failure_events WHERE thread_id = ?")
+          .get("thr_fallback"),
+      ).toEqual({ event_seq: null });
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
   it("pauses a failed Goal from structured provider rate-limit events", async () => {
     const resetAt = Date.parse("2099-08-22T12:05:00.000Z");
     const { bb, harness } = createFakePluginHost({
