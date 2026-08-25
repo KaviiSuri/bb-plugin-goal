@@ -17,15 +17,15 @@ export interface ClassifiedGoalFailure {
   readonly event: GoalFailureEventIdentity | null;
 }
 
-const failureEventTypes = new Set([
+const terminalFailureEventTypes = new Set([
   "provider/error",
-  "provider/rateLimits/updated",
   "system/error",
 ]);
 
 const providerErrorData = z
   .object({
     message: z.string().optional(),
+    willRetry: z.boolean().optional(),
     errorInfo: z
       .object({
         category: z.string(),
@@ -77,71 +77,85 @@ function validResetAt(
   return Number.isNaN(resetAt.getTime()) ? null : resetAt.toISOString();
 }
 
-function latestFailureEvent(
+function latestEvent(
   events: readonly GoalFailureEvent[],
+  predicate: (event: GoalFailureEvent) => boolean,
 ): GoalFailureEvent | null {
-  return (
-    events
-      .filter((event) => failureEventTypes.has(event.type))
-      .reduce<GoalFailureEvent | null>(
-        (latest, event) =>
-          latest === null || event.seq > latest.seq ? event : latest,
-        null,
-      ) ?? null
+  return events.reduce<GoalFailureEvent | null>(
+    (latest, event) =>
+      predicate(event) && (latest === null || event.seq > latest.seq)
+        ? event
+        : latest,
+    null,
   );
 }
 
+function blockedRateLimits(
+  event: GoalFailureEvent | null,
+  nowMs: number,
+): { readonly kind: GoalUsageLimitKind; readonly reason: string; readonly resetAt: string | null } | null {
+  if (event === null) return null;
+  const parsedRate = rateLimitsData.safeParse(event.data);
+  if (!parsedRate.success || parsedRate.data.rateLimits.status !== "blocked") {
+    return null;
+  }
+  const rate = parsedRate.data.rateLimits;
+  const resetAt = (rate.windows ?? [])
+    .map((window) =>
+      window.status === "blocked" ? validResetAt(window.resetsAtMs, nowMs) : null,
+    )
+    .find((candidate): candidate is string => candidate !== null) ?? null;
+  return {
+    kind: rate.kind,
+    reason: rate.reachedReason ?? "Provider usage limit reached.",
+    resetAt,
+  };
+}
+
 /**
- * Classify the newest structured failure event by its authoritative turn
- * scope and durable sequence. The event kind is deliberately not a priority:
- * an older rate-limit event must not override a newer ordinary provider error.
+ * Classify a failed run as a fact set. A terminal rate-limit error pairs with
+ * the latest blocked rate-limit state in the same run; the event kind alone
+ * is not a priority and cannot make stale history win.
  */
 export function classifyGoalFailureWithIdentity(
   events: readonly GoalFailureEvent[],
   nowMs: number,
   fallbackMessage: string | null = null,
 ): ClassifiedGoalFailure {
-  const event = latestFailureEvent(events);
-  if (event?.type === "provider/rateLimits/updated") {
-    const parsedRate = rateLimitsData.safeParse(event.data);
-    if (parsedRate.success && parsedRate.data.rateLimits.status === "blocked") {
-      const rate = parsedRate.data.rateLimits;
-      const resetAt = (rate.windows ?? [])
-        .map((window) =>
-          window.status === "blocked"
-            ? validResetAt(window.resetsAtMs, nowMs)
-            : null,
-        )
-        .find((candidate): candidate is string => candidate !== null) ?? null;
-      return {
-        event,
-        failure: usageFailure(
-          rate.kind,
-          rate.reachedReason ?? "Provider usage limit reached.",
-          resetAt,
-        ),
-      };
-    }
-  }
+  const terminal = latestEvent(events, (event) =>
+    terminalFailureEventTypes.has(event.type),
+  );
+  const latestRateLimits = latestEvent(
+    events,
+    (event) => event.type === "provider/rateLimits/updated",
+  );
+  const blockedRate = blockedRateLimits(latestRateLimits, nowMs);
 
-  if (event?.type === "provider/error") {
-    const parsedProvider = providerErrorData.safeParse(event.data);
+  if (terminal?.type === "provider/error") {
+    const parsedProvider = providerErrorData.safeParse(terminal.data);
     if (parsedProvider.success) {
       const info = parsedProvider.data.errorInfo;
-      if (info?.category === "rate-limit") {
+      if (info?.category === "rate-limit" && parsedProvider.data.willRetry !== true) {
         return {
-          event,
-          failure: usageFailure(
-            "unknown",
-            parsedProvider.data.message ?? "Provider rate limit reached.",
-            null,
-          ),
+          event: terminal,
+          failure:
+            blockedRate === null
+              ? usageFailure(
+                  "unknown",
+                  parsedProvider.data.message ?? "Provider rate limit reached.",
+                  null,
+                )
+              : usageFailure(
+                  blockedRate.kind,
+                  blockedRate.reason,
+                  blockedRate.resetAt,
+                ),
         };
       }
       const category = info?.category ?? "unknown";
       const code = info?.providerCode === null ? null : info?.providerCode;
       return {
-        event,
+        event: terminal,
         failure: {
           kind: "ordinary",
           source: "provider",
@@ -152,14 +166,14 @@ export function classifyGoalFailureWithIdentity(
   }
 
   const systemMessage =
-    event?.type === "system/error"
+    terminal?.type === "system/error"
       ? z
           .object({ message: z.string().optional() })
           .passthrough()
-          .safeParse(event.data)
+          .safeParse(terminal.data)
       : null;
   return {
-    event,
+    event: terminal,
     failure: {
       kind: "ordinary",
       source: "turn",
@@ -171,7 +185,7 @@ export function classifyGoalFailureWithIdentity(
   };
 }
 
-/** Classify only structured provider events; prose is display-only fallback. */
+/** Classify structured facts; fallback prose is display-only. */
 export function classifyGoalFailure(
   events: readonly GoalFailureEvent[],
   nowMs: number,

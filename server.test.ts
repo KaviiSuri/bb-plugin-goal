@@ -438,8 +438,20 @@ describe("Goal BB adapter", () => {
                 data: { clientRequestId: "request_current" },
               },
               {
-                id: "event-turn-completed",
+                id: "event-terminal-rate-error",
                 seq: 9,
+                createdAt: resetAt - 0.5,
+                scope: { kind: "turn", turnId: "turn_current" },
+                threadId: "thr_failure",
+                type: "provider/error",
+                data: {
+                  message: "terminal provider rate limit",
+                  errorInfo: { category: "rate-limit", providerCode: null },
+                },
+              },
+              {
+                id: "event-turn-completed",
+                seq: 10,
                 createdAt: resetAt,
                 scope: { kind: "turn", turnId: "turn_current" },
                 threadId: "thr_failure",

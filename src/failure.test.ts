@@ -5,7 +5,7 @@ import {
 } from "./failure";
 
 describe("structured Goal failure classification", () => {
-  it("uses a structured subscription window reset and ignores failure prose", () => {
+  it("pairs a terminal rate-limit error with blocked thread rate state", () => {
     expect(
       classifyGoalFailure(
         [
@@ -26,6 +26,16 @@ describe("structured Goal failure classification", () => {
                   },
                 ],
               },
+            },
+          },
+          {
+            id: "event-terminal-rate-error",
+            seq: 3,
+            createdAt: Date.parse("2026-08-22T12:01:01.000Z"),
+            type: "provider/error",
+            data: {
+              message: "terminal provider rate limit",
+              errorInfo: { category: "rate-limit", providerCode: null },
             },
           },
         ],
@@ -111,6 +121,16 @@ describe("structured Goal failure classification", () => {
                 reachedReason: "credits exhausted",
                 windows: [],
               },
+            },
+          },
+          {
+            id: "event-terminal-credits-error",
+            seq: 5,
+            createdAt: Date.parse("2026-08-22T12:02:01.000Z"),
+            type: "provider/error",
+            data: {
+              message: "credits exhausted",
+              errorInfo: { category: "rate-limit", providerCode: null },
             },
           },
         ],
