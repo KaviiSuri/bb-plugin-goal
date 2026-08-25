@@ -812,41 +812,81 @@ export function createPlugin(
       },
     });
 
+    const CONTINUATION_RETRY_BASE_MS = 25;
+    const CONTINUATION_RETRY_MAX_MS = 1_000;
     let disposed = false;
     let wakeWorker: (() => void) | null = null;
+    const pendingIdleEvents = new Map<
+      string,
+      { readonly threadId: string; readonly opportunityKey: string }
+    >();
     const wake = () => {
       const resolve = wakeWorker;
       wakeWorker = null;
       resolve?.();
     };
-    const waitForWork = (signal: AbortSignal): Promise<void> => {
+    const waitForWork = (
+      signal: AbortSignal,
+      timeoutMs: number | null = null,
+    ): Promise<void> => {
       if (signal.aborted) return Promise.resolve();
       return new Promise((resolve) => {
+        let timer: ReturnType<typeof setTimeout> | undefined;
         const finish = () => {
+          if (timer !== undefined) clearTimeout(timer);
           signal.removeEventListener("abort", finish);
           if (wakeWorker === finish) wakeWorker = null;
           resolve();
         };
         wakeWorker = finish;
         signal.addEventListener("abort", finish, { once: true });
+        if (timeoutMs !== null) timer = setTimeout(finish, timeoutMs);
       });
+    };
+
+    const retryPendingIdleEvents = async (signal: AbortSignal) => {
+      for (const [opportunityKey, event] of pendingIdleEvents) {
+        if (signal.aborted) return;
+        await runtime.enqueueIdle(event.threadId, opportunityKey);
+        pendingIdleEvents.delete(opportunityKey);
+      }
     };
 
     bb.events.on("thread.idle", async ({ thread }) => {
       if (disposed) return;
-      await runtime.enqueueIdle(thread.id, `idle:${thread.updatedAt}`);
-      wake();
+      const opportunityKey = `idle:${thread.updatedAt}`;
+      try {
+        await runtime.enqueueIdle(thread.id, opportunityKey);
+        pendingIdleEvents.delete(opportunityKey);
+        wake();
+      } catch (cause) {
+        if (disposed) return;
+        pendingIdleEvents.set(opportunityKey, {
+          threadId: thread.id,
+          opportunityKey,
+        });
+        bb.log.error(
+          `Could not enqueue idle Continuation: ${
+            cause instanceof Error ? cause.message : String(cause)
+          }`,
+        );
+        wake();
+      }
     });
 
     bb.background.service("continuations", {
       async start(signal) {
+        let retryDelayMs = CONTINUATION_RETRY_BASE_MS;
         while (!signal.aborted) {
           try {
+            await retryPendingIdleEvents(signal);
             await runtime.recoverContinuations();
             let claimed = false;
             do {
               claimed = await runtime.processContinuation(signal);
             } while (claimed && !signal.aborted);
+            retryDelayMs = CONTINUATION_RETRY_BASE_MS;
+            if (!signal.aborted) await waitForWork(signal);
           } catch (cause) {
             if (signal.aborted) break;
             bb.log.error(
@@ -854,8 +894,12 @@ export function createPlugin(
                 cause instanceof Error ? cause.message : String(cause)
               }`,
             );
+            await waitForWork(signal, retryDelayMs);
+            retryDelayMs = Math.min(
+              retryDelayMs * 2,
+              CONTINUATION_RETRY_MAX_MS,
+            );
           }
-          if (!signal.aborted) await waitForWork(signal);
         }
       },
     });

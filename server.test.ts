@@ -56,6 +56,17 @@ function agentContext(
   };
 }
 
+async function waitUntil(
+  predicate: () => boolean,
+  timeoutMs = 500,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error("Timed out waiting for test state.");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
 function fakeHost() {
   return createFakePluginHost({
     pluginId: "goal",
@@ -174,6 +185,144 @@ describe("Goal BB adapter", () => {
     } finally {
       service.controller.abort();
       await service.done;
+      await harness.lifecycle.dispose();
+    }
+  });
+
+  it("contains idle enqueue failures and retries without another idle event", async () => {
+    let enqueueAttempts = 0;
+    let sends = 0;
+    const observedPlugin = createPlugin({
+      makeRuntime(database, gateway): GoalRuntime {
+        const runtime = makeGoalRuntime(database, gateway, {
+          nextGoalId: () => "goal_enqueue_retry",
+          nowIso: () => "2026-08-22T12:00:00.000Z",
+        });
+        return {
+          ...runtime,
+          async enqueueIdle(threadId, opportunityKey) {
+            enqueueAttempts += 1;
+            if (enqueueAttempts === 1) {
+              throw new Error("transient enqueue failure");
+            }
+            await runtime.enqueueIdle(threadId, opportunityKey);
+          },
+        };
+      },
+    });
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "goal",
+      sdk: {
+        threads: {
+          get: async ({ threadId }) =>
+            makeThreadResponse({
+              id: threadId,
+              status: "idle",
+              updatedAt: 42,
+              environmentId: "env_test",
+            }),
+          send: async () => {
+            sends += 1;
+            return { ok: true };
+          },
+        },
+      },
+    });
+    await observedPlugin(bb);
+    const service = harness.behavior.runService("continuations");
+    try {
+      await harness.behavior.callRpc("start", {
+        threadId: "thr_enqueue_retry",
+        objective: "retry the failed idle enqueue",
+      });
+      const eventResult = await harness.behavior.emitThreadEvent(
+        "thread.idle",
+        {
+          thread: makeThreadResponse({
+            id: "thr_enqueue_retry",
+            status: "idle",
+            updatedAt: 42,
+            environmentId: "env_test",
+          }),
+          lastAssistantText: null,
+        },
+      );
+      expect(eventResult.errors).toEqual([]);
+      await waitUntil(() => sends === 1);
+      expect(enqueueAttempts).toBeGreaterThanOrEqual(2);
+      expect(
+        harness.inspection.logEntries.some((entry) =>
+          entry.message.includes("transient enqueue failure"),
+        ),
+      ).toBe(true);
+    } finally {
+      service.controller.abort();
+      await service.done;
+      await harness.lifecycle.dispose();
+    }
+  });
+
+  it("retries transient startup recovery without a new idle event", async () => {
+    let recoveryAttempts = 0;
+    const observedPlugin = createPlugin({
+      makeRuntime(database, gateway): GoalRuntime {
+        const runtime = makeGoalRuntime(database, gateway);
+        return {
+          ...runtime,
+          async recoverContinuations() {
+            recoveryAttempts += 1;
+            if (recoveryAttempts === 1) {
+              throw new Error("transient startup recovery failure");
+            }
+            await runtime.recoverContinuations();
+          },
+        };
+      },
+    });
+    const { bb, harness } = fakeHost();
+    await observedPlugin(bb);
+    const service = harness.behavior.runService("continuations");
+    try {
+      await waitUntil(() => recoveryAttempts >= 2);
+      expect(
+        harness.inspection.logEntries.some((entry) =>
+          entry.message.includes("transient startup recovery failure"),
+        ),
+      ).toBe(true);
+    } finally {
+      service.controller.abort();
+      await service.done;
+      await harness.lifecycle.dispose();
+    }
+  });
+
+  it("cancels a retry wait without leaving the recovery service running", async () => {
+    let recoveryAttempts = 0;
+    const observedPlugin = createPlugin({
+      makeRuntime(database, gateway): GoalRuntime {
+        const runtime = makeGoalRuntime(database, gateway);
+        return {
+          ...runtime,
+          async recoverContinuations() {
+            recoveryAttempts += 1;
+            throw new Error("persistent recovery failure");
+          },
+        };
+      },
+    });
+    const { bb, harness } = fakeHost();
+    await observedPlugin(bb);
+    const service = harness.behavior.runService("continuations");
+    try {
+      await waitUntil(() => recoveryAttempts >= 1);
+      service.controller.abort();
+      await Promise.race([
+        service.done,
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("service did not cancel")), 200),
+        ),
+      ]);
+    } finally {
       await harness.lifecycle.dispose();
     }
   });
