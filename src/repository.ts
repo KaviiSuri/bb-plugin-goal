@@ -3,6 +3,7 @@ import { Context, Effect, Layer, Schema } from "effect";
 import {
   GoalAlreadyExists,
   GoalDtoSchema,
+  GoalInvalidBlockage,
   GoalInvalidTransition,
   GoalNotFound,
   GoalPersistenceError,
@@ -61,6 +62,16 @@ export const GOAL_MIGRATIONS = [
   `ALTER TABLE goals ADD COLUMN blockage_external_action TEXT;
    ALTER TABLE goals ADD COLUMN blockage_evidence TEXT;
    ALTER TABLE goals ADD COLUMN blockage_repeated_turns INTEGER`,
+  `CREATE TABLE IF NOT EXISTS goal_blockage_qualifications (
+    goal_id TEXT PRIMARY KEY,
+    thread_id TEXT NOT NULL,
+    goal_revision INTEGER NOT NULL CHECK (goal_revision >= 1),
+    blocker_key TEXT NOT NULL,
+    external_action TEXT NOT NULL,
+    evidence TEXT NOT NULL,
+    repeated_turns INTEGER NOT NULL CHECK (repeated_turns >= 1),
+    updated_at TEXT NOT NULL
+  )`,
 ] as const;
 
 export function migrateGoalDatabase(database: BetterSqlite3.Database): void {
@@ -103,6 +114,7 @@ type GoalMutationError =
   | GoalNotFound
   | GoalStaleGuard
   | GoalInvalidTransition
+  | GoalInvalidBlockage
   | GoalPersistenceError;
 
 type GoalDeleteError = GoalNotFound | GoalStaleGuard | GoalPersistenceError;
@@ -153,8 +165,18 @@ type GoalRow = {
 
 type GoalHistoryRow = GoalRow & { readonly historySequence: number };
 
+type GoalBlockageQualificationRow = {
+  readonly goalRevision: number;
+  readonly blockerKey: string;
+  readonly repeatedTurns: number;
+};
+
 function messageFromCause(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
+}
+
+function normalizeBlocker(externalAction: string): string {
+  return externalAction.trim().replace(/\s+/g, " ").toLocaleLowerCase();
 }
 
 function permitsMutation(goal: GoalDto, action: GoalGuardedAction): boolean {
@@ -175,7 +197,8 @@ function mutationErrorFromCause(cause: unknown): GoalMutationError {
   if (
     cause instanceof GoalNotFound ||
     cause instanceof GoalStaleGuard ||
-    cause instanceof GoalInvalidTransition
+    cause instanceof GoalInvalidTransition ||
+    cause instanceof GoalInvalidBlockage
   ) {
     return cause;
   }
@@ -332,6 +355,29 @@ export function makeGoalRepositoryLayer(
           WHERE id = ? AND thread_id = ? AND revision = ?
             AND state = 'active' AND finished_at IS NULL`,
       );
+      const selectBlockageQualification = database.prepare<
+        [string, string],
+        GoalBlockageQualificationRow
+      >(`SELECT goal_revision AS goalRevision,
+            blocker_key AS blockerKey, repeated_turns AS repeatedTurns
+          FROM goal_blockage_qualifications
+          WHERE goal_id = ? AND thread_id = ?`);
+      const saveBlockageQualification = database.prepare(
+        `INSERT INTO goal_blockage_qualifications (
+          goal_id, thread_id, goal_revision, blocker_key, external_action,
+          evidence, repeated_turns, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(goal_id) DO UPDATE SET
+          goal_revision = excluded.goal_revision,
+          blocker_key = excluded.blocker_key,
+          external_action = excluded.external_action,
+          evidence = excluded.evidence,
+          repeated_turns = excluded.repeated_turns,
+          updated_at = excluded.updated_at`,
+      );
+      const deleteBlockageQualification = database.prepare(
+        `DELETE FROM goal_blockage_qualifications WHERE goal_id = ?`,
+      );
       const deleteByGuard = database.prepare(
         `DELETE FROM goals
           WHERE id = ? AND thread_id = ? AND revision = ?`,
@@ -411,6 +457,48 @@ export function makeGoalRepositoryLayer(
               action: command.type,
               state: before.state,
             });
+          }
+
+          if (command.type === "block") {
+            const qualification = selectBlockageQualification.get(
+              command.goalId,
+              command.threadId,
+            );
+            const qualificationForRevision =
+              qualification === undefined ||
+              qualification.goalRevision !== command.expectedRevision
+                ? undefined
+                : qualification;
+            const expectedTurns =
+              qualificationForRevision === undefined
+                ? 1
+                : qualificationForRevision.repeatedTurns + 1;
+            const blockerKey = normalizeBlocker(command.externalAction);
+            if (
+              qualificationForRevision !== undefined &&
+              qualificationForRevision.blockerKey !== blockerKey
+            ) {
+              throw new GoalInvalidBlockage({
+                message:
+                  "Goal Blockage requires the same external blocker across consecutive reports.",
+              });
+            }
+            if (command.repeatedTurns !== expectedTurns) {
+              throw new GoalInvalidBlockage({
+                message: `Goal Blockage report ${command.repeatedTurns} is out of sequence; expected report ${expectedTurns}.`,
+              });
+            }
+            saveBlockageQualification.run(
+              command.goalId,
+              command.threadId,
+              command.expectedRevision,
+              blockerKey,
+              command.externalAction,
+              command.evidence,
+              command.repeatedTurns,
+              now,
+            );
+            if (command.repeatedTurns < 3) return before;
           }
 
           const result = (() => {
@@ -494,6 +582,9 @@ export function makeGoalRepositoryLayer(
             });
           }
 
+          if (command.type !== "block") {
+            deleteBlockageQualification.run(command.goalId);
+          }
           const updated = readByThreadAndId(
             command.goalId,
             command.threadId,
@@ -542,6 +633,7 @@ export function makeGoalRepositoryLayer(
             });
           }
           deleteHistoryOrder.run(record.goalId);
+          deleteBlockageQualification.run(record.goalId);
           return before;
         },
       );

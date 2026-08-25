@@ -279,7 +279,7 @@ describe("Goal coordinator", () => {
     }
   });
 
-  it("reports a durable external Blockage only with three repeated turns", async () => {
+  it("qualifies the same durable Blockage across reload before terminal report three", async () => {
     const fixture = makeFixture();
     try {
       await fixture.runtime.run({
@@ -288,116 +288,186 @@ describe("Goal coordinator", () => {
         objective: "wait for the external dependency",
       });
 
-      const recoverable = await fixture.runtime.run({
-        type: "block",
-        threadId: "thr_one",
-        goalId: "goal_1",
-        expectedRevision: 1,
-        externalAction: "Keep trying",
-        evidence: "The next attempt may still succeed.",
-        repeatedTurns: 3,
-      });
-      expect(recoverable).toMatchObject({
-        ok: false,
-        error: { code: "invalid_blockage" },
-      });
-
-      const insufficient = await fixture.runtime.run({
-        type: "block",
-        threadId: "thr_one",
-        goalId: "goal_1",
-        expectedRevision: 1,
-        externalAction: "  User must provide the credential  ",
-        evidence: "  The provider rejected every request.  ",
-        repeatedTurns: 2,
-      });
-      expect(insufficient).toEqual({
-        ok: false,
-        error: {
-          code: "invalid_blockage",
-          message:
-            "Goal Blockage requires at least three consecutive turns with the same blocker.",
-        },
-      });
       await expect(
-        fixture.runtime.run({ type: "status", threadId: "thr_one" }),
+        fixture.runtime.run({
+          type: "block",
+          threadId: "thr_one",
+          goalId: "goal_1",
+          expectedRevision: 1,
+          externalAction: "Keep trying",
+          evidence: "The next attempt may still succeed.",
+          repeatedTurns: 1,
+        }),
       ).resolves.toMatchObject({
-        ok: true,
-        goal: { state: "active", revision: 1 },
-      });
-
-      const changed = await fixture.runtime.run({
-        type: "block",
-        threadId: "thr_one",
-        goalId: "goal_1",
-        expectedRevision: 1,
-        externalAction: "User must grant filesystem access",
-        evidence: "The same operation now fails for a different reason.",
-        repeatedTurns: 3,
-      });
-      expect(changed).toEqual({
         ok: false,
-        error: {
-          code: "invalid_blockage",
-          message:
-            "Goal Blockage requires the same external blocker across the reported turns.",
-        },
+        error: { code: "invalid_blockage" },
       });
-
-      const missingEvidence = await fixture.runtime.run({
-        type: "block",
-        threadId: "thr_one",
-        goalId: "goal_1",
-        expectedRevision: 1,
-        externalAction: "User must provide the credential",
-        evidence: "   ",
-        repeatedTurns: 3,
-      });
-      expect(missingEvidence).toMatchObject({
+      await expect(
+        fixture.runtime.run({
+          type: "block",
+          threadId: "thr_one",
+          goalId: "goal_1",
+          expectedRevision: 1,
+          externalAction: "User must provide the credential",
+          evidence: "   ",
+          repeatedTurns: 1,
+        }),
+      ).resolves.toMatchObject({
         ok: false,
         error: { code: "invalid_blockage" },
       });
 
-      const blocked = await fixture.runtime.run({
-        type: "block",
-        threadId: "thr_one",
-        goalId: "goal_1",
-        expectedRevision: 1,
-        externalAction: "  User must provide the credential  ",
-        evidence: "  Provider rejected every request with credential_missing.  ",
-        repeatedTurns: 3,
-      });
-      expect(blocked).toMatchObject({
-        ok: true,
-        goal: {
-          id: "goal_1",
-          state: "blocked",
-          revision: 2,
-          finishedAt: "2026-08-22T12:00:00.000Z",
-          blockageExternalAction: "User must provide the credential",
-          blockageEvidence: "Provider rejected every request with credential_missing.",
-          blockageRepeatedTurns: 3,
-        },
-      });
       await expect(
-        fixture.runtime.run({ type: "status", threadId: "thr_one" }),
-      ).resolves.toEqual({ ok: true, goal: null });
+        fixture.runtime.run({
+          type: "block",
+          threadId: "thr_one",
+          goalId: "goal_missing",
+          expectedRevision: 1,
+          externalAction: "User must provide the credential",
+          evidence: "The provider rejected the request.",
+          repeatedTurns: 1,
+        }),
+      ).resolves.toMatchObject({
+        ok: false,
+        error: { code: "goal_not_found" },
+      });
 
-      const stale = await fixture.runtime.run({
-        type: "block",
+      const edited = await fixture.runtime.run({
+        type: "edit",
         threadId: "thr_one",
         goalId: "goal_1",
         expectedRevision: 1,
-        externalAction: "User must provide the credential",
-        evidence: "old evidence",
-        repeatedTurns: 3,
+        objective: "wait for the external dependency with evidence",
       });
-      expect(stale).toMatchObject({
+      expect(edited).toMatchObject({ ok: true, goal: { revision: 2 } });
+      await expect(
+        fixture.runtime.run({
+          type: "block",
+          threadId: "thr_one",
+          goalId: "goal_1",
+          expectedRevision: 1,
+          externalAction: "User must provide the credential",
+          evidence: "Stale evidence.",
+          repeatedTurns: 1,
+        }),
+      ).resolves.toMatchObject({
         ok: false,
         error: { code: "stale_goal" },
       });
+
+      const first = await fixture.runtime.run({
+        type: "block",
+        threadId: "thr_one",
+        goalId: "goal_1",
+        expectedRevision: 2,
+        externalAction: "  User must provide the credential  ",
+        evidence: "  Provider rejected the first request.  ",
+        repeatedTurns: 1,
+      });
+      expect(first).toMatchObject({
+        ok: true,
+        goal: { state: "active", revision: 2 },
+      });
+
+      await fixture.runtime.dispose();
+      const reloaded = makeGoalRuntime(
+        fixture.database,
+        { threadExists: async () => true },
+        {
+          nextGoalId: () => "unused",
+          nowIso: () => "2026-08-22T12:01:00.000Z",
+        },
+      );
+      try {
+        const second = await reloaded.run({
+          type: "block",
+          threadId: "thr_one",
+          goalId: "goal_1",
+          expectedRevision: 2,
+          externalAction: "USER must provide the   credential",
+          evidence: "Provider rejected the second request.",
+          repeatedTurns: 2,
+        });
+        expect(second).toMatchObject({
+          ok: true,
+          goal: { state: "active", revision: 2 },
+        });
+
+        const changed = await reloaded.run({
+          type: "block",
+          threadId: "thr_one",
+          goalId: "goal_1",
+          expectedRevision: 2,
+          externalAction: "User must grant filesystem access",
+          evidence: "The blocker changed.",
+          repeatedTurns: 3,
+        });
+        expect(changed).toMatchObject({
+          ok: false,
+          error: { code: "invalid_blockage" },
+        });
+
+        const duplicate = await reloaded.run({
+          type: "block",
+          threadId: "thr_one",
+          goalId: "goal_1",
+          expectedRevision: 2,
+          externalAction: "User must provide the credential",
+          evidence: "Duplicate second report.",
+          repeatedTurns: 2,
+        });
+        expect(duplicate).toEqual({
+          ok: false,
+          error: {
+            code: "invalid_blockage",
+            message:
+              "Goal Blockage report 2 is out of sequence; expected report 3.",
+          },
+        });
+
+        const gap = await reloaded.run({
+          type: "block",
+          threadId: "thr_one",
+          goalId: "goal_1",
+          expectedRevision: 2,
+          externalAction: "User must provide the credential",
+          evidence: "Skipped report.",
+          repeatedTurns: 4,
+        });
+        expect(gap).toMatchObject({
+          ok: false,
+          error: { code: "invalid_blockage" },
+        });
+
+        const blocked = await reloaded.run({
+          type: "block",
+          threadId: "thr_one",
+          goalId: "goal_1",
+          expectedRevision: 2,
+          externalAction: "User must provide the credential",
+          evidence: "Provider rejected all three requests with credential_missing.",
+          repeatedTurns: 3,
+        });
+        expect(blocked).toMatchObject({
+          ok: true,
+          goal: {
+            id: "goal_1",
+            state: "blocked",
+            revision: 3,
+            finishedAt: "2026-08-22T12:01:00.000Z",
+            blockageExternalAction: "User must provide the credential",
+            blockageRepeatedTurns: 3,
+          },
+        });
+        await expect(
+          reloaded.run({ type: "status", threadId: "thr_one" }),
+        ).resolves.toEqual({ ok: true, goal: null });
+      } finally {
+        await reloaded.dispose();
+      }
     } finally {
-      await fixture.close();
+      if (fixture.database.open) fixture.database.close();
+      rmSync(fixture.directory, { recursive: true, force: true });
     }
   });
 

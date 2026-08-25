@@ -57,7 +57,7 @@ export const goalBlockedInputSchema = z
     expectedRevision: z.number().int().positive(),
     externalAction: z.string().trim().min(1),
     evidence: z.string().trim().min(1),
-    repeatedTurns: z.number().int().min(3),
+    repeatedTurns: z.number().int().min(1),
   })
   .strict();
 
@@ -495,7 +495,7 @@ function goalBlockedParameters(goal: GoalDto): Record<string, unknown> {
       expectedRevision: { type: "integer", const: goal.revision },
       externalAction: { type: "string", minLength: 1 },
       evidence: { type: "string", minLength: 1 },
-      repeatedTurns: { type: "integer", minimum: 3 },
+      repeatedTurns: { type: "integer", minimum: 1 },
     },
   };
 }
@@ -832,7 +832,17 @@ export function createPlugin(
           content: [
             {
               type: "text",
-              text: JSON.stringify({ goal }),
+              text: JSON.stringify({
+                goal,
+                blockageReport:
+                  goal.state === "blocked"
+                    ? { status: "blocked", repeatedTurns: input.repeatedTurns }
+                    : {
+                        status: "qualifying",
+                        repeatedTurns: input.repeatedTurns,
+                        turnsRemaining: 3 - input.repeatedTurns,
+                      },
+              }),
             },
           ],
         };

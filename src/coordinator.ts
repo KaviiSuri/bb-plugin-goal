@@ -110,10 +110,6 @@ export class GoalCoordinator extends Context.Service<
       const gateway = yield* GoalThreadGateway;
       const ids = yield* GoalIdGenerator;
       const clock = yield* GoalClock;
-      const blockageObservations = new Map<
-        string,
-        { readonly externalAction: string; readonly repeatedTurns: number }
-      >();
 
       const execute = Effect.fn("GoalCoordinator.execute")(
         function* (command: GoalCommand) {
@@ -209,44 +205,22 @@ export class GoalCoordinator extends Context.Service<
             if (
               externalAction.length === 0 ||
               evidence.length === 0 ||
-              isRecoverableBlocker(externalAction)
-            ) {
-              return yield* new GoalInvalidBlockage({
-                message:
-                  "Goal Blockage requires an external action and concrete evidence.",
-              });
-            }
-            const observationKey = `${command.goalId}:${command.expectedRevision}`;
-            const previous = blockageObservations.get(observationKey);
-            if (
-              previous !== undefined &&
-              previous.externalAction !== externalAction
-            ) {
-              return yield* new GoalInvalidBlockage({
-                message:
-                  "Goal Blockage requires the same external blocker across the reported turns.",
-              });
-            }
-            if (
+              isRecoverableBlocker(externalAction) ||
               !Number.isInteger(command.repeatedTurns) ||
-              command.repeatedTurns < 3
+              command.repeatedTurns < 1
             ) {
-              blockageObservations.set(observationKey, {
-                externalAction,
-                repeatedTurns: command.repeatedTurns,
-              });
               return yield* new GoalInvalidBlockage({
                 message:
-                  "Goal Blockage requires at least three consecutive turns with the same blocker.",
+                  "Goal Blockage requires an external action, concrete evidence, and a positive consecutive-turn count.",
               });
             }
             const now = yield* clock.nowIso;
-            const result = yield* repository.mutate({
-              command: { ...command, externalAction, evidence },
-              now,
-            });
-            blockageObservations.delete(observationKey);
-            return { goal: result };
+            return {
+              goal: yield* repository.mutate({
+                command: { ...command, externalAction, evidence },
+                now,
+              }),
+            };
           }
 
           const guardedCommand =
