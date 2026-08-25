@@ -399,6 +399,253 @@ describe("Goal coordinator", () => {
     }
   });
 
+  it("retains sequential Goal history after a terminal Goal", async () => {
+    const fixture = makeFixture();
+    try {
+      await fixture.runtime.run({
+        type: "start",
+        threadId: "thr_one",
+        objective: "first objective",
+      });
+      await fixture.runtime.run({
+        type: "cancel",
+        threadId: "thr_one",
+        goalId: "goal_1",
+        expectedRevision: 1,
+      });
+      const second = await fixture.runtime.run({
+        type: "start",
+        threadId: "thr_one",
+        objective: "second objective",
+      });
+      expect(second).toMatchObject({
+        ok: true,
+        goal: { id: "goal_2", state: "active" },
+      });
+
+      const history = await fixture.runtime.run({
+        type: "history",
+        threadId: "thr_one",
+        limit: 20,
+        cursor: null,
+      });
+      expect(history).toMatchObject({
+        ok: true,
+        page: {
+          goals: [
+            { id: "goal_2", objective: "second objective", finishedAt: null },
+            { id: "goal_1", objective: "first objective", state: "canceled" },
+          ],
+          nextCursor: null,
+        },
+      });
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("paginates newest-first history with stable opaque cursors", async () => {
+    const fixture = makeFixture();
+    try {
+      for (let index = 1; index <= 5; index += 1) {
+        await fixture.runtime.run({
+          type: "start",
+          threadId: "thr_one",
+          objective: `objective ${index}`,
+        });
+        await fixture.runtime.run({
+          type: "cancel",
+          threadId: "thr_one",
+          goalId: `goal_${index}`,
+          expectedRevision: 1,
+        });
+      }
+
+      const first = await fixture.runtime.run({
+        type: "history",
+        threadId: "thr_one",
+        limit: 2,
+        cursor: null,
+      });
+      expect(first).toMatchObject({
+        ok: true,
+        page: { goals: [{ id: "goal_5" }, { id: "goal_4" }] },
+      });
+      if (!first.ok || !("page" in first) || first.page.nextCursor === null) {
+        throw new Error("Expected a history cursor");
+      }
+      expect(first.page.nextCursor).not.toContain("goal_4");
+
+      await fixture.runtime.run({
+        type: "start",
+        threadId: "thr_one",
+        objective: "newly inserted objective",
+      });
+
+      const second = await fixture.runtime.run({
+        type: "history",
+        threadId: "thr_one",
+        limit: 2,
+        cursor: first.page.nextCursor,
+      });
+      expect(second).toMatchObject({
+        ok: true,
+        page: {
+          goals: [{ id: "goal_3" }, { id: "goal_2" }],
+        },
+      });
+      if (!second.ok || !("page" in second) || second.page.nextCursor === null) {
+        throw new Error("Expected a second history cursor");
+      }
+      await expect(
+        fixture.runtime.run({
+          type: "history",
+          threadId: "thr_one",
+          limit: 2,
+          cursor: second.page.nextCursor,
+        }),
+      ).resolves.toMatchObject({
+        ok: true,
+        page: { goals: [{ id: "goal_1" }], nextCursor: null },
+      });
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("rejects malformed and cross-thread history cursors", async () => {
+    const fixture = makeFixture(["thr_one", "thr_two"]);
+    try {
+      for (let index = 1; index <= 2; index += 1) {
+        await fixture.runtime.run({
+          type: "start",
+          threadId: "thr_one",
+          objective: `objective ${index}`,
+        });
+        await fixture.runtime.run({
+          type: "cancel",
+          threadId: "thr_one",
+          goalId: `goal_${index}`,
+          expectedRevision: 1,
+        });
+      }
+      const first = await fixture.runtime.run({
+        type: "history",
+        threadId: "thr_one",
+        limit: 1,
+        cursor: null,
+      });
+      if (!first.ok || !("page" in first) || first.page.nextCursor === null) {
+        throw new Error("Expected a history cursor");
+      }
+
+      for (const [threadId, cursor] of [
+        ["thr_one", "not-a-cursor"],
+        ["thr_two", first.page.nextCursor],
+      ] as const) {
+        await expect(
+          fixture.runtime.run({
+            type: "history",
+            threadId,
+            limit: 1,
+            cursor,
+          }),
+        ).resolves.toEqual({
+          ok: false,
+          error: {
+            code: "invalid_cursor",
+            message: "The Goal history cursor is invalid or expired.",
+          },
+        });
+      }
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("shows one Goal and deletes only the revision-guarded record", async () => {
+    const fixture = makeFixture(["thr_one", "thr_two"]);
+    try {
+      await fixture.runtime.run({
+        type: "start",
+        threadId: "thr_one",
+        objective: "historical objective",
+      });
+      await fixture.runtime.run({
+        type: "cancel",
+        threadId: "thr_one",
+        goalId: "goal_1",
+        expectedRevision: 1,
+      });
+      await fixture.runtime.run({
+        type: "start",
+        threadId: "thr_one",
+        objective: "current objective",
+      });
+
+      await expect(
+        fixture.runtime.run({ type: "show", goalId: "goal_1" }),
+      ).resolves.toMatchObject({
+        ok: true,
+        goal: { id: "goal_1", state: "canceled", revision: 2 },
+      });
+      await expect(
+        fixture.runtime.run({ type: "show", goalId: "goal_missing" }),
+      ).resolves.toEqual({
+        ok: false,
+        error: {
+          code: "goal_not_found",
+          message: "Goal goal_missing was not found.",
+        },
+      });
+
+      await expect(
+        fixture.runtime.run({
+          type: "delete",
+          threadId: "thr_two",
+          goalId: "goal_2",
+          expectedRevision: 1,
+        }),
+      ).resolves.toMatchObject({
+        ok: false,
+        error: { code: "goal_not_found" },
+      });
+      await expect(
+        fixture.runtime.run({
+          type: "delete",
+          threadId: "thr_one",
+          goalId: "goal_1",
+          expectedRevision: 1,
+        }),
+      ).resolves.toMatchObject({
+        ok: false,
+        error: { code: "stale_goal" },
+      });
+
+      await expect(
+        fixture.runtime.run({
+          type: "delete",
+          threadId: "thr_one",
+          goalId: "goal_1",
+          expectedRevision: 2,
+        }),
+      ).resolves.toMatchObject({ ok: true, goal: { id: "goal_1" } });
+      await expect(
+        fixture.runtime.run({ type: "status", threadId: "thr_one" }),
+      ).resolves.toMatchObject({
+        ok: true,
+        goal: { id: "goal_2", objective: "current objective" },
+      });
+      expect(
+        fixture.database
+          .prepare("SELECT id FROM goals ORDER BY id")
+          .all(),
+      ).toEqual([{ id: "goal_2" }]);
+    } finally {
+      await fixture.close();
+    }
+  });
+
   it("rejects commands for a missing existing thread", async () => {
     const fixture = makeFixture([]);
     try {

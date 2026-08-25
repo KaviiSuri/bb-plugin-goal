@@ -5,7 +5,22 @@ import {
 } from "@get-bb/plugin-sdk/testing";
 import plugin, { createPlugin } from "./server";
 import type { GoalDto } from "./src/domain";
+import { GOAL_MIGRATIONS } from "./src/repository";
 import { makeGoalRuntime, type GoalRuntime } from "./src/runtime";
+
+function deterministicPlugin() {
+  let id = 0;
+  let tick = 0;
+  return createPlugin({
+    makeRuntime(database, gateway) {
+      return makeGoalRuntime(database, gateway, {
+        nextGoalId: () => `goal_cli_${++id}`,
+        nowIso: () =>
+          new Date(Date.UTC(2026, 7, 22, 12, 0, tick++)).toISOString(),
+      });
+    },
+  });
+}
 
 function fakeHost() {
   return createFakePluginHost({
@@ -48,6 +63,9 @@ describe("Goal BB adapter", () => {
         "pause",
         "resume",
         "cancel",
+        "history",
+        "show",
+        "delete",
       ]);
       expect(harness.inspection.registrations.cli).toMatchObject({
         name: "goal",
@@ -58,10 +76,62 @@ describe("Goal BB adapter", () => {
           { name: "pause" },
           { name: "resume" },
           { name: "cancel" },
+          { name: "history" },
+          { name: "show" },
+          { name: "delete" },
         ],
       });
     } finally {
       await harness.lifecycle.dispose();
+    }
+  });
+
+  it("backfills legacy Goal rows through the production migration runner", async () => {
+    const initial = fakeHost();
+    await (async (bb: Parameters<typeof plugin>[0]) => {
+      const database = bb.storage.database();
+      bb.storage.migrate(database, [...GOAL_MIGRATIONS.slice(0, 2)]);
+      const insert = database.prepare(
+        `INSERT INTO goals (
+          id, thread_id, objective, state, revision,
+          created_at, updated_at, finished_at
+        ) VALUES (?, 'thr_legacy', ?, 'canceled', 2, ?, ?, ?)`,
+      );
+      insert.run(
+        "goal_legacy_first",
+        "first legacy objective",
+        "2026-08-22T11:00:00.000Z",
+        "2026-08-22T11:01:00.000Z",
+        "2026-08-22T11:01:00.000Z",
+      );
+      insert.run(
+        "goal_legacy_second",
+        "second legacy objective",
+        "2026-08-22T11:00:00.000Z",
+        "2026-08-22T11:02:00.000Z",
+        "2026-08-22T11:02:00.000Z",
+      );
+    })(initial.bb);
+
+    const migrated = await initial.harness.lifecycle.reload(
+      deterministicPlugin(),
+    );
+    try {
+      await expect(
+        migrated.harness.behavior.callRpc("history", {
+          threadId: "thr_legacy",
+          limit: 20,
+          cursor: null,
+        }),
+      ).resolves.toMatchObject({
+        goals: [
+          { id: "goal_legacy_second" },
+          { id: "goal_legacy_first" },
+        ],
+        nextCursor: null,
+      });
+    } finally {
+      await migrated.harness.lifecycle.dispose();
     }
   });
 
@@ -256,6 +326,184 @@ describe("Goal BB adapter", () => {
         },
       });
       expect(harness.inspection.realtimeSignals).toHaveLength(5);
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
+  it("browses, shows, and deliberately deletes Goal history through the CLI", async () => {
+    const { bb, harness } = fakeHost();
+    await deterministicPlugin()(bb);
+    try {
+      await harness.behavior.runCli(["start", "first objective"], {
+        threadId: "thr_cli_history",
+      });
+      await harness.behavior.runCli(["cancel"], {
+        threadId: "thr_cli_history",
+      });
+      await harness.behavior.runCli(["start", "second objective"], {
+        threadId: "thr_cli_history",
+      });
+
+      const firstPage = await harness.behavior.runCli(
+        ["history", "--limit", "1", "--json"],
+        { threadId: "thr_cli_history" },
+      );
+      expect(firstPage.exitCode).toBe(0);
+      const firstPageJson = JSON.parse(firstPage.stdout) as {
+        goals: GoalDto[];
+        nextCursor: string | null;
+      };
+      expect(firstPageJson.goals).toMatchObject([
+        { id: "goal_cli_2", objective: "second objective", state: "active" },
+      ]);
+      expect(firstPageJson.nextCursor).not.toBeNull();
+
+      const secondPage = await harness.behavior.runCli(
+        [
+          "history",
+          "thr_cli_history",
+          "--limit=1",
+          `--cursor=${firstPageJson.nextCursor}`,
+          "--json",
+        ],
+      );
+      const secondPageJson = JSON.parse(secondPage.stdout) as {
+        goals: GoalDto[];
+        nextCursor: string | null;
+      };
+      expect(secondPageJson).toMatchObject({
+        goals: [{ id: "goal_cli_1", state: "canceled" }],
+        nextCursor: null,
+      });
+
+      const shown = await harness.behavior.runCli([
+        "show",
+        "goal_cli_1",
+        "--json",
+      ]);
+      expect(JSON.parse(shown.stdout)).toMatchObject({
+        goal: { id: "goal_cli_1", threadId: "thr_cli_history" },
+      });
+
+      const unconfirmed = await harness.behavior.runCli([
+        "delete",
+        "goal_cli_1",
+        "--json",
+      ]);
+      expect(unconfirmed.exitCode).toBe(2);
+      expect(JSON.parse(unconfirmed.stderr)).toMatchObject({
+        error: { code: "invalid_arguments" },
+      });
+
+      const deleted = await harness.behavior.runCli([
+        "delete",
+        "goal_cli_1",
+        "--yes",
+      ]);
+      expect(deleted.stdout).toContain("Deleted Goal");
+      expect(deleted.stdout).toContain("ID: goal_cli_1");
+
+      const status = await harness.behavior.runCli(["status", "--json"], {
+        threadId: "thr_cli_history",
+      });
+      expect(JSON.parse(status.stdout)).toMatchObject({
+        goal: { id: "goal_cli_2", objective: "second objective" },
+      });
+      const missing = await harness.behavior.runCli([
+        "show",
+        "goal_cli_1",
+        "--json",
+      ]);
+      expect(missing.exitCode).toBe(3);
+      expect(JSON.parse(missing.stderr)).toMatchObject({
+        error: { code: "goal_not_found" },
+      });
+      expect(harness.inspection.realtimeSignals).toHaveLength(4);
+      expect(harness.inspection.realtimeSignals.at(-1)).toMatchObject({
+        payload: { goalId: "goal_cli_1", deleted: true },
+      });
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
+  it("returns stable errors for invalid history limits and cursors", async () => {
+    const { bb, harness } = fakeHost();
+    await plugin(bb);
+    try {
+      const invalidLimit = await harness.behavior.runCli(
+        ["history", "--limit", "101", "--json"],
+        { threadId: "thr_history_errors" },
+      );
+      expect(invalidLimit.exitCode).toBe(2);
+      expect(JSON.parse(invalidLimit.stderr)).toMatchObject({
+        error: { code: "invalid_arguments" },
+      });
+
+      const invalidCursor = await harness.behavior.runCli(
+        ["history", "--cursor", "invalid", "--json"],
+        { threadId: "thr_history_errors" },
+      );
+      expect(invalidCursor.exitCode).toBe(2);
+      expect(JSON.parse(invalidCursor.stderr)).toEqual({
+        ok: false,
+        error: {
+          code: "invalid_cursor",
+          message: "The Goal history cursor is invalid or expired.",
+        },
+      });
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
+  it("exposes guarded history deletion through RPC", async () => {
+    const { bb, harness } = fakeHost();
+    await deterministicPlugin()(bb);
+    try {
+      const first = (await harness.behavior.callRpc("start", {
+        threadId: "thr_rpc_history",
+        objective: "first objective",
+      })) as { goal: GoalDto };
+      await harness.behavior.callRpc("cancel", {
+        threadId: "thr_rpc_history",
+        goalId: first.goal.id,
+        expectedRevision: 1,
+      });
+      const second = (await harness.behavior.callRpc("start", {
+        threadId: "thr_rpc_history",
+        objective: "second objective",
+      })) as { goal: GoalDto };
+
+      await expect(
+        harness.behavior.callRpc("history", {
+          threadId: "thr_rpc_history",
+          limit: 20,
+          cursor: null,
+        }),
+      ).resolves.toMatchObject({
+        goals: [{ id: second.goal.id }, { id: first.goal.id }],
+      });
+      await expect(
+        harness.behavior.callRpc("delete", {
+          threadId: "thr_rpc_history",
+          goalId: first.goal.id,
+          expectedRevision: 1,
+        }),
+      ).rejects.toThrow("[stale_goal]");
+      await expect(
+        harness.behavior.callRpc("delete", {
+          threadId: "thr_rpc_history",
+          goalId: first.goal.id,
+          expectedRevision: 2,
+        }),
+      ).resolves.toMatchObject({ goal: { id: first.goal.id } });
+      await expect(
+        harness.behavior.callRpc("status", {
+          threadId: "thr_rpc_history",
+        }),
+      ).resolves.toEqual({ goal: second.goal });
     } finally {
       await harness.lifecycle.dispose();
     }

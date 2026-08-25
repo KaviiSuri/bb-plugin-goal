@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { fireEvent } from "@testing-library/react";
+import { fireEvent, waitFor } from "@testing-library/react";
+import type { JsonValue } from "@get-bb/plugin-sdk/app";
 import {
   loadPluginApp,
   renderSlot,
@@ -41,6 +42,12 @@ function goalBanner() {
   return banner;
 }
 
+function historyPanel() {
+  const panel = app.threadPanelActions[0];
+  if (panel === undefined) throw new Error("Goal history panel was not registered");
+  return panel;
+}
+
 function handlers(initialGoal: Goal | null): RpcHandlers {
   let goal = initialGoal;
   return {
@@ -75,12 +82,35 @@ function handlers(initialGoal: Goal | null): RpcHandlers {
       goal = null;
       return { goal: canceled };
     },
+    history: () => ({
+      goals: goal === null ? [] : [goal],
+      nextCursor: null,
+    }),
+    show: ({ goalId }) => {
+      if (goal === null || goal.id !== goalId) throw new Error("missing Goal");
+      return { goal };
+    },
+    delete: ({ goalId, expectedRevision }) => {
+      if (
+        goal === null ||
+        goal.id !== goalId ||
+        goal.revision !== expectedRevision
+      ) {
+        throw new Error("stale Goal");
+      }
+      const deleted = goal;
+      goal = null;
+      return { goal: deleted };
+    },
   };
 }
 
 describe("Goal composer row", () => {
   it("is an always-visible thread composer banner with a start path", async () => {
     expect(app.composerCustomizations).toHaveLength(1);
+    expect(app.threadPanelActions).toMatchObject([
+      { id: "history", title: "Goal history", icon: "History" },
+    ]);
     expect(app.composerCustomizations[0]).toMatchObject({
       id: "goal-row",
       scopes: ["thread"],
@@ -93,6 +123,7 @@ describe("Goal composer row", () => {
       {
         context: { threadId: "thr_ui", projectId: "proj_ui" },
         rpc: handlers(null),
+        openThreadPanel: () => true,
       },
     );
     try {
@@ -103,6 +134,13 @@ describe("Goal composer row", () => {
 
       expect(await slot.findByText("Active Goal")).toBeTruthy();
       expect(slot.getByText("Ship the complete path")).toBeTruthy();
+      fireEvent.click(slot.getByRole("button", { name: "History" }));
+      expect(slot.inspection.navigateCalls).toEqual([
+        {
+          method: "openThreadPanel",
+          options: { actionId: "history", title: "Goal history" },
+        },
+      ]);
       expect(slot.inspection.rpcCalls).toEqual([
         { method: "status", input: { threadId: "thr_ui" } },
         {
@@ -233,6 +271,134 @@ describe("Goal composer row", () => {
       ]);
     } finally {
       slot.lifecycle.unmount();
+    }
+  });
+
+  it("paginates panel history, confirms exact deletion, and refreshes realtime", async () => {
+    const historical: Goal = {
+      ...activeGoal,
+      id: "goal_old",
+      objective: "Finished historical objective",
+      state: "canceled",
+      revision: 3,
+      finishedAt: "2026-08-22T11:00:00.000Z",
+    };
+    let goals: Goal[] = [activeGoal, historical];
+    const rpc: RpcHandlers = {
+      ...handlers(activeGoal),
+      history: ({ cursor }) => ({
+        goals: cursor === null ? goals.slice(0, 1) : goals.slice(1),
+        nextCursor: cursor === null && goals.length > 1 ? "older" : null,
+      }),
+      delete: ({ threadId, goalId, expectedRevision }) => {
+        const goal = goals.find((candidate) => candidate.id === goalId);
+        if (
+          goal === undefined ||
+          goal.threadId !== threadId ||
+          goal.revision !== expectedRevision
+        ) {
+          throw new Error("stale Goal");
+        }
+        goals = goals.filter((candidate) => candidate.id !== goalId);
+        return { goal };
+      },
+    };
+
+    const slot = renderSlot<
+      { threadId: string; params: JsonValue | null },
+      typeof rpcContract
+    >(
+      historyPanel(),
+      { threadId: "thr_ui", params: null },
+      { rpc },
+    );
+    try {
+      expect(await slot.findByText(activeGoal.objective)).toBeTruthy();
+      fireEvent.click(
+        slot.getByRole("button", { name: "Load older Goals" }),
+      );
+      expect(await slot.findByText(historical.objective)).toBeTruthy();
+
+      const deleteButtons = slot.getAllByRole("button", { name: "Delete" });
+      fireEvent.click(deleteButtons[1]!);
+      expect(slot.getByText("Delete this Goal permanently?")).toBeTruthy();
+      expect(
+        slot.inspection.rpcCalls.filter((call) => call.method === "delete"),
+      ).toHaveLength(0);
+      fireEvent.click(slot.getByRole("button", { name: "Confirm delete" }));
+      await waitFor(() => {
+        expect(slot.queryByText(historical.objective)).toBeNull();
+      });
+      expect(
+        slot.inspection.rpcCalls.filter((call) => call.method === "delete"),
+      ).toEqual([
+        {
+          method: "delete",
+          input: {
+            threadId: "thr_ui",
+            goalId: "goal_old",
+            expectedRevision: 3,
+          },
+        },
+      ]);
+
+      goals = [
+        {
+          ...activeGoal,
+          objective: "Updated outside the panel",
+          revision: 2,
+        },
+      ];
+      await slot.behavior.emitRealtime("goal.changed", {
+        threadId: "thr_ui",
+        goalId: "goal_ui",
+        revision: 2,
+      });
+      expect(await slot.findByText("Updated outside the panel")).toBeTruthy();
+    } finally {
+      slot.lifecycle.unmount();
+    }
+  });
+
+  it("renders panel empty and error states", async () => {
+    const empty = renderSlot<
+      { threadId: string; params: JsonValue | null },
+      typeof rpcContract
+    >(
+      historyPanel(),
+      { threadId: "thr_ui", params: null },
+      { rpc: handlers(null) },
+    );
+    try {
+      expect(empty.getByText("Loading Goal history")).toBeTruthy();
+      expect(
+        await empty.findByText("No Goals have been recorded for this thread."),
+      ).toBeTruthy();
+    } finally {
+      empty.lifecycle.unmount();
+    }
+
+    const failing: RpcHandlers = {
+      ...handlers(null),
+      history: () => {
+        throw new Error("History is temporarily unavailable");
+      },
+    };
+    const errored = renderSlot<
+      { threadId: string; params: JsonValue | null },
+      typeof rpcContract
+    >(
+      historyPanel(),
+      { threadId: "thr_ui", params: null },
+      { rpc: failing },
+    );
+    try {
+      expect(
+        await errored.findByText("History is temporarily unavailable"),
+      ).toBeTruthy();
+      expect(errored.getByRole("button", { name: "Retry" })).toBeTruthy();
+    } finally {
+      errored.lifecycle.unmount();
     }
   });
 

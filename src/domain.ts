@@ -14,6 +14,9 @@ export type GoalState = (typeof goalStates)[number];
 export const goalMutationTypes = ["edit", "pause", "resume", "cancel"] as const;
 export type GoalMutationType = (typeof goalMutationTypes)[number];
 
+export const GOAL_HISTORY_DEFAULT_LIMIT = 20;
+export const GOAL_HISTORY_MAX_LIMIT = 100;
+
 export const GoalDtoSchema = Schema.Struct({
   id: Schema.String,
   threadId: Schema.String,
@@ -36,6 +39,11 @@ export interface GoalDto {
   readonly finishedAt: string | null;
 }
 
+export interface GoalHistoryPage {
+  readonly goals: readonly GoalDto[];
+  readonly nextCursor: string | null;
+}
+
 interface GuardedGoalCommand {
   readonly threadId: string;
   readonly goalId: string;
@@ -52,12 +60,25 @@ export type GoalCommand =
       readonly type: "status";
       readonly threadId: string;
     }
+  | {
+      readonly type: "history";
+      readonly threadId: string;
+      readonly limit: number;
+      readonly cursor: string | null;
+    }
+  | {
+      readonly type: "show";
+      readonly goalId: string;
+    }
   | (GuardedGoalCommand & {
       readonly type: "edit";
       readonly objective: string;
     })
   | (GuardedGoalCommand & {
       readonly type: "pause" | "resume" | "cancel";
+    })
+  | (GuardedGoalCommand & {
+      readonly type: "delete";
     });
 
 export type GoalMutationCommand = Extract<
@@ -104,6 +125,21 @@ export class GoalThreadNotFound extends Schema.TaggedError<GoalThreadNotFound>()
   { threadId: Schema.String },
 ) {}
 
+export class GoalRecordNotFound extends Schema.TaggedError<GoalRecordNotFound>()(
+  "GoalRecordNotFound",
+  { goalId: Schema.String },
+) {}
+
+export class GoalInvalidCursor extends Schema.TaggedError<GoalInvalidCursor>()(
+  "GoalInvalidCursor",
+  { message: Schema.String },
+) {}
+
+export class GoalInvalidHistoryQuery extends Schema.TaggedError<GoalInvalidHistoryQuery>()(
+  "GoalInvalidHistoryQuery",
+  { message: Schema.String },
+) {}
+
 export class GoalInvalidObjective extends Schema.TaggedError<GoalInvalidObjective>()(
   "GoalInvalidObjective",
   { message: Schema.String },
@@ -125,6 +161,9 @@ export type GoalError =
   | GoalStaleGuard
   | GoalInvalidTransition
   | GoalThreadNotFound
+  | GoalRecordNotFound
+  | GoalInvalidCursor
+  | GoalInvalidHistoryQuery
   | GoalInvalidObjective
   | GoalPersistenceError
   | GoalGatewayError;
@@ -135,6 +174,8 @@ export type GoalErrorCode =
   | "stale_goal"
   | "invalid_transition"
   | "thread_not_found"
+  | "invalid_cursor"
+  | "invalid_arguments"
   | "invalid_objective"
   | "persistence_error"
   | "gateway_error";
@@ -146,6 +187,7 @@ export interface GoalErrorDto {
 
 export type GoalCommandResult =
   | { readonly ok: true; readonly goal: GoalDto | null }
+  | { readonly ok: true; readonly page: GoalHistoryPage }
   | { readonly ok: false; readonly error: GoalErrorDto };
 
 export function goalErrorToDto(error: GoalError): GoalErrorDto {
@@ -175,6 +217,15 @@ export function goalErrorToDto(error: GoalError): GoalErrorDto {
         code: "thread_not_found",
         message: `Thread ${error.threadId} was not found.`,
       };
+    case "GoalRecordNotFound":
+      return {
+        code: "goal_not_found",
+        message: `Goal ${error.goalId} was not found.`,
+      };
+    case "GoalInvalidCursor":
+      return { code: "invalid_cursor", message: error.message };
+    case "GoalInvalidHistoryQuery":
+      return { code: "invalid_arguments", message: error.message };
     case "GoalInvalidObjective":
       return { code: "invalid_objective", message: error.message };
     case "GoalPersistenceError":

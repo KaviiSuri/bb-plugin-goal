@@ -6,11 +6,17 @@ import {
   GoalInvalidTransition,
   GoalNotFound,
   GoalPersistenceError,
+  GoalRecordNotFound,
   GoalStaleGuard,
   type GoalDto,
+  type GoalHistoryPage,
   type GoalMutationCommand,
   type GoalMutationType,
 } from "./domain";
+import {
+  encodeGoalHistoryCursor,
+  type GoalHistoryBoundary,
+} from "./history-cursor";
 
 export const GOAL_MIGRATIONS = [
   `CREATE TABLE IF NOT EXISTS goals (
@@ -26,6 +32,28 @@ export const GOAL_MIGRATIONS = [
   `CREATE UNIQUE INDEX IF NOT EXISTS goals_one_unfinished_per_thread
     ON goals(thread_id)
     WHERE finished_at IS NULL`,
+  `CREATE TABLE IF NOT EXISTS goal_history_order (
+      goal_id TEXT PRIMARY KEY,
+      thread_id TEXT NOT NULL,
+      sequence INTEGER NOT NULL CHECK (sequence >= 1),
+      UNIQUE(thread_id, sequence)
+    );
+    INSERT OR IGNORE INTO goal_history_order (goal_id, thread_id, sequence)
+      SELECT id, thread_id,
+        ROW_NUMBER() OVER (PARTITION BY thread_id ORDER BY created_at, rowid)
+      FROM goals;
+    CREATE TABLE IF NOT EXISTS goal_history_counters (
+      thread_id TEXT PRIMARY KEY,
+      last_sequence INTEGER NOT NULL CHECK (last_sequence >= 1)
+    );
+    INSERT INTO goal_history_counters (thread_id, last_sequence)
+      SELECT thread_id, MAX(sequence)
+      FROM goal_history_order
+      GROUP BY thread_id
+      ON CONFLICT(thread_id) DO UPDATE SET
+        last_sequence = MAX(last_sequence, excluded.last_sequence);
+    CREATE INDEX IF NOT EXISTS goals_history_by_thread
+      ON goal_history_order(thread_id, sequence DESC)`,
 ] as const;
 
 export function migrateGoalDatabase(database: BetterSqlite3.Database): void {
@@ -49,11 +77,25 @@ export interface MutateGoalRecord {
   readonly now: string;
 }
 
+export interface HistoryGoalRecords {
+  readonly threadId: string;
+  readonly limit: number;
+  readonly boundary: GoalHistoryBoundary | null;
+}
+
+export interface DeleteGoalRecord {
+  readonly threadId: string;
+  readonly goalId: string;
+  readonly expectedRevision: number;
+}
+
 type GoalMutationError =
   | GoalNotFound
   | GoalStaleGuard
   | GoalInvalidTransition
   | GoalPersistenceError;
+
+type GoalDeleteError = GoalNotFound | GoalStaleGuard | GoalPersistenceError;
 
 interface GoalRepositoryService {
   readonly start: (
@@ -62,9 +104,18 @@ interface GoalRepositoryService {
   readonly current: (
     threadId: string,
   ) => Effect.Effect<GoalDto | null, GoalPersistenceError>;
+  readonly history: (
+    record: HistoryGoalRecords,
+  ) => Effect.Effect<GoalHistoryPage, GoalPersistenceError>;
+  readonly find: (
+    goalId: string,
+  ) => Effect.Effect<GoalDto, GoalRecordNotFound | GoalPersistenceError>;
   readonly mutate: (
     record: MutateGoalRecord,
   ) => Effect.Effect<GoalDto, GoalMutationError>;
+  readonly delete: (
+    record: DeleteGoalRecord,
+  ) => Effect.Effect<GoalDto, GoalDeleteError>;
 }
 
 export class GoalRepository extends Context.Service<
@@ -84,6 +135,8 @@ type GoalRow = {
   readonly updatedAt: string;
   readonly finishedAt: string | null;
 };
+
+type GoalHistoryRow = GoalRow & { readonly historySequence: number };
 
 function messageFromCause(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
@@ -114,6 +167,15 @@ function mutationErrorFromCause(cause: unknown): GoalMutationError {
   });
 }
 
+function deleteErrorFromCause(cause: unknown): GoalDeleteError {
+  if (cause instanceof GoalNotFound || cause instanceof GoalStaleGuard) {
+    return cause;
+  }
+  return new GoalPersistenceError({
+    message: `Could not delete Goal: ${messageFromCause(cause)}`,
+  });
+}
+
 export function makeGoalRepositoryLayer(
   database: BetterSqlite3.Database,
 ): Layer.Layer<GoalRepository> {
@@ -134,10 +196,53 @@ export function makeGoalRepositoryLayer(
         WHERE thread_id = ? AND finished_at IS NULL
         ORDER BY created_at DESC
         LIMIT 1`);
-      const selectById = database.prepare<[string, string], GoalRow>(
+      const historyColumns = `SELECT
+          goals.id,
+          goals.thread_id AS threadId,
+          goals.objective,
+          goals.state,
+          goals.revision,
+          goals.created_at AS createdAt,
+          goals.updated_at AS updatedAt,
+          goals.finished_at AS finishedAt,
+          goal_history_order.sequence AS historySequence
+        FROM goals
+        INNER JOIN goal_history_order
+          ON goal_history_order.goal_id = goals.id`;
+      const selectByThreadAndId = database.prepare<[string, string], GoalRow>(
         `${goalColumns} WHERE id = ? AND thread_id = ? LIMIT 1`,
       );
+      const selectById = database.prepare<[string], GoalRow>(
+        `${goalColumns} WHERE id = ? LIMIT 1`,
+      );
+      const selectHistoryFirst = database.prepare<
+        [string, number],
+        GoalHistoryRow
+      >(`${historyColumns}
+          WHERE goal_history_order.thread_id = ?
+          ORDER BY goal_history_order.sequence DESC
+          LIMIT ?`);
+      const selectHistoryAfter = database.prepare<
+        [string, number, number],
+        GoalHistoryRow
+      >(`${historyColumns}
+          WHERE goal_history_order.thread_id = ?
+            AND goal_history_order.sequence < ?
+          ORDER BY goal_history_order.sequence DESC
+          LIMIT ?`);
 
+      const nextHistorySequence = database.prepare<
+        [string],
+        { readonly sequence: number }
+      >(`INSERT INTO goal_history_counters (thread_id, last_sequence)
+          VALUES (?, 1)
+          ON CONFLICT(thread_id) DO UPDATE SET
+            last_sequence = last_sequence + 1
+          RETURNING last_sequence AS sequence`);
+      const insertHistoryOrder = database.prepare(
+        `INSERT INTO goal_history_order (goal_id, thread_id, sequence)
+          VALUES (?, ?, ?)`,
+      );
       const insert = database.prepare(
         `INSERT INTO goals (
           id, thread_id, objective, state, revision,
@@ -164,13 +269,27 @@ export function makeGoalRepositoryLayer(
           SET state = 'canceled', revision = revision + 1, updated_at = ?, finished_at = ?
           WHERE id = ? AND thread_id = ? AND revision = ? AND finished_at IS NULL`,
       );
+      const deleteByGuard = database.prepare(
+        `DELETE FROM goals
+          WHERE id = ? AND thread_id = ? AND revision = ?`,
+      );
+      const deleteHistoryOrder = database.prepare(
+        `DELETE FROM goal_history_order WHERE goal_id = ?`,
+      );
 
       const readCurrent = (threadId: string): GoalDto | null => {
         const row = selectCurrent.get(threadId);
         return row === undefined ? null : (decodeGoal(row) as GoalDto);
       };
-      const readById = (goalId: string, threadId: string): GoalDto | null => {
-        const row = selectById.get(goalId, threadId);
+      const readByThreadAndId = (
+        goalId: string,
+        threadId: string,
+      ): GoalDto | null => {
+        const row = selectByThreadAndId.get(goalId, threadId);
+        return row === undefined ? null : (decodeGoal(row) as GoalDto);
+      };
+      const readById = (goalId: string): GoalDto | null => {
+        const row = selectById.get(goalId);
         return row === undefined ? null : (decodeGoal(row) as GoalDto);
       };
 
@@ -193,6 +312,12 @@ export function makeGoalRepositoryLayer(
             throw cause;
           }
 
+          const counter = nextHistorySequence.get(record.threadId);
+          if (counter === undefined) {
+            throw new Error("Goal history sequence was not allocated.");
+          }
+          insertHistoryOrder.run(record.id, record.threadId, counter.sequence);
+
           const created = readCurrent(record.threadId);
           if (created === null) {
             throw new Error("Goal insert completed without a readable record.");
@@ -203,7 +328,7 @@ export function makeGoalRepositoryLayer(
 
       const mutateTransaction = database.transaction(
         ({ command, now }: MutateGoalRecord): GoalDto => {
-          const before = readById(command.goalId, command.threadId);
+          const before = readByThreadAndId(command.goalId, command.threadId);
           if (before === null) {
             throw new GoalNotFound({
               threadId: command.threadId,
@@ -261,7 +386,10 @@ export function makeGoalRepositoryLayer(
           })();
 
           if (result.changes !== 1) {
-            const current = readById(command.goalId, command.threadId);
+            const current = readByThreadAndId(
+              command.goalId,
+              command.threadId,
+            );
             if (current === null) {
               throw new GoalNotFound({
                 threadId: command.threadId,
@@ -282,11 +410,55 @@ export function makeGoalRepositoryLayer(
             });
           }
 
-          const updated = readById(command.goalId, command.threadId);
+          const updated = readByThreadAndId(
+            command.goalId,
+            command.threadId,
+          );
           if (updated === null) {
             throw new Error("Goal update completed without a readable record.");
           }
           return updated;
+        },
+      );
+
+      const deleteTransaction = database.transaction(
+        (record: DeleteGoalRecord): GoalDto => {
+          const before = readByThreadAndId(record.goalId, record.threadId);
+          if (before === null) {
+            throw new GoalNotFound({
+              threadId: record.threadId,
+              goalId: record.goalId,
+            });
+          }
+          if (before.revision !== record.expectedRevision) {
+            throw new GoalStaleGuard({
+              goalId: record.goalId,
+              expectedRevision: record.expectedRevision,
+              actualRevision: before.revision,
+            });
+          }
+
+          const result = deleteByGuard.run(
+            record.goalId,
+            record.threadId,
+            record.expectedRevision,
+          );
+          if (result.changes !== 1) {
+            const current = readByThreadAndId(record.goalId, record.threadId);
+            if (current === null) {
+              throw new GoalNotFound({
+                threadId: record.threadId,
+                goalId: record.goalId,
+              });
+            }
+            throw new GoalStaleGuard({
+              goalId: record.goalId,
+              expectedRevision: record.expectedRevision,
+              actualRevision: current.revision,
+            });
+          }
+          deleteHistoryOrder.run(record.goalId);
+          return before;
         },
       );
 
@@ -298,6 +470,57 @@ export function makeGoalRepositoryLayer(
               message: `Could not read Goal state: ${messageFromCause(cause)}`,
             }),
         }),
+      );
+
+      const history = Effect.fn("GoalRepository.history")(
+        (record: HistoryGoalRecords) =>
+          Effect.try({
+            try: (): GoalHistoryPage => {
+              const rowLimit = record.limit + 1;
+              const rows =
+                record.boundary === null
+                  ? selectHistoryFirst.all(record.threadId, rowLimit)
+                  : selectHistoryAfter.all(
+                      record.threadId,
+                      record.boundary.sequence,
+                      rowLimit,
+                    );
+              const goals = rows
+                .slice(0, record.limit)
+                .map((row) => decodeGoal(row) as GoalDto);
+              const lastRow = rows.at(record.limit - 1);
+              return {
+                goals,
+                nextCursor:
+                  rows.length > record.limit && lastRow !== undefined
+                    ? encodeGoalHistoryCursor({
+                        threadId: record.threadId,
+                        sequence: lastRow.historySequence,
+                      })
+                    : null,
+              };
+            },
+            catch: (cause) =>
+              new GoalPersistenceError({
+                message: `Could not read Goal history: ${messageFromCause(cause)}`,
+              }),
+          }),
+      );
+
+      const find = Effect.fn("GoalRepository.find")((goalId: string) =>
+        Effect.try({
+          try: () => readById(goalId),
+          catch: (cause) =>
+            new GoalPersistenceError({
+              message: `Could not read Goal: ${messageFromCause(cause)}`,
+            }),
+        }).pipe(
+          Effect.flatMap((goal) =>
+            goal === null
+              ? Effect.fail(new GoalRecordNotFound({ goalId }))
+              : Effect.succeed(goal),
+          ),
+        ),
       );
 
       const start = Effect.fn("GoalRepository.start")((record: StartGoalRecord) =>
@@ -329,7 +552,22 @@ export function makeGoalRepositoryLayer(
           }),
       );
 
-      return GoalRepository.of({ current, start, mutate });
+      const deleteGoal = Effect.fn("GoalRepository.delete")(
+        (record: DeleteGoalRecord) =>
+          Effect.try({
+            try: () => deleteTransaction(record),
+            catch: deleteErrorFromCause,
+          }),
+      );
+
+      return GoalRepository.of({
+        current,
+        history,
+        find,
+        start,
+        mutate,
+        delete: deleteGoal,
+      });
     }),
   );
 }

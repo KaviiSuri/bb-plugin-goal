@@ -71,7 +71,7 @@ export function makeGoalRuntime(
       );
       return Result.isFailure(result)
         ? { ok: false, error: goalErrorToDto(result.failure) }
-        : { ok: true, goal: result.success };
+        : { ok: true, ...result.success };
     },
     async dispose() {
       if (disposed) return;

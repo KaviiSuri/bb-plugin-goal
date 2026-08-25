@@ -44,4 +44,13 @@ bb goal resume --json
 bb goal cancel
 ```
 
-Pass `thr_example` after any subcommand to target that thread explicitly. Mutations use the current Goal revision as a compare-and-swap guard, so a concurrent edit or transition fails instead of overwriting newer state.
+Browse sequential history, inspect one opaque Goal ID, or deliberately delete one record:
+
+```sh
+bb goal history thr_example --limit 20
+bb goal history thr_example --cursor <opaque-cursor> --json
+bb goal show goal_example
+bb goal delete goal_example --yes
+```
+
+Thread-scoped commands accept `thr_example` after the subcommand. `show` and `delete` target an opaque Goal ID directly; deletion always requires `--yes`. Mutations use the current Goal revision as a compare-and-swap guard, so a concurrent edit or transition fails instead of overwriting newer state.

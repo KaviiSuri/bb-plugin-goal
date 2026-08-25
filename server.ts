@@ -8,9 +8,12 @@ import {
 } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import {
+  GOAL_HISTORY_DEFAULT_LIMIT,
+  GOAL_HISTORY_MAX_LIMIT,
   goalStates,
   type GoalCommandResult,
   type GoalDto,
+  type GoalHistoryPage,
   type GoalMutationType,
 } from "./src/domain";
 import { GOAL_MIGRATIONS } from "./src/repository";
@@ -66,6 +69,29 @@ export const rpcContract = defineRpcContract({
     input: z.object(goalGuardSchema).strict(),
     output: z.object({ goal: goalSchema }).strict(),
   },
+  history: {
+    input: z
+      .object({
+        threadId: z.string().min(1),
+        limit: z.number().int().min(1).max(GOAL_HISTORY_MAX_LIMIT),
+        cursor: z.string().min(1).nullable(),
+      })
+      .strict(),
+    output: z
+      .object({
+        goals: z.array(goalSchema),
+        nextCursor: z.string().nullable(),
+      })
+      .strict(),
+  },
+  show: {
+    input: z.object({ goalId: z.string().min(1) }).strict(),
+    output: z.object({ goal: goalSchema }).strict(),
+  },
+  delete: {
+    input: z.object(goalGuardSchema).strict(),
+    output: z.object({ goal: goalSchema }).strict(),
+  },
 });
 
 interface PluginDependencies {
@@ -79,11 +105,24 @@ const liveDependencies: PluginDependencies = { makeRuntime: makeGoalRuntime };
 
 class CliUsageError extends Error {}
 
-function requireSuccessful(result: GoalCommandResult): GoalDto | null {
+function requireGoalSuccessful(result: GoalCommandResult): GoalDto | null {
   if (!result.ok) {
     throw new Error(`[${result.error.code}] ${result.error.message}`);
   }
+  if (!("goal" in result)) {
+    throw new Error("Goal command returned history instead of a Goal.");
+  }
   return result.goal;
+}
+
+function requireHistorySuccessful(result: GoalCommandResult): GoalHistoryPage {
+  if (!result.ok) {
+    throw new Error(`[${result.error.code}] ${result.error.message}`);
+  }
+  if (!("page" in result)) {
+    throw new Error("Goal history command returned a Goal instead of history.");
+  }
+  return result.page;
 }
 
 function formatGoal(goal: GoalDto, heading: string): string {
@@ -104,6 +143,8 @@ function jsonLine(value: unknown): string {
 function resultExitCode(result: GoalCommandResult): number {
   if (result.ok) return 0;
   switch (result.error.code) {
+    case "invalid_arguments":
+    case "invalid_cursor":
     case "invalid_objective":
       return 2;
     case "thread_not_found":
@@ -134,6 +175,9 @@ function commandResult(
         : `${result.error.message}\n`,
     };
   }
+  if (!("goal" in result)) {
+    return { exitCode: 1, stderr: "Goal command returned invalid output.\n" };
+  }
   if (json) return { exitCode: 0, stdout: jsonLine({ goal: result.goal }) };
   return {
     exitCode: 0,
@@ -144,16 +188,73 @@ function commandResult(
   };
 }
 
+function historyResult(
+  result: GoalCommandResult,
+  json: boolean,
+  threadId: string,
+): PluginCliResult {
+  const exitCode = resultExitCode(result);
+  if (!result.ok) {
+    return {
+      exitCode,
+      stderr: json
+        ? jsonLine({ ok: false, error: result.error })
+        : `${result.error.message}\n`,
+    };
+  }
+  if (!("page" in result)) {
+    return { exitCode: 1, stderr: "Goal history returned invalid output.\n" };
+  }
+  if (json) return { exitCode: 0, stdout: jsonLine(result.page) };
+  if (result.page.goals.length === 0) {
+    return { exitCode: 0, stdout: `No Goal history for thread ${threadId}.\n` };
+  }
+  const output = result.page.goals
+    .map((goal, index) => formatGoal(goal, index === 0 ? "Goal History" : "---"))
+    .join("\n");
+  return {
+    exitCode: 0,
+    stdout: `${output}${
+      result.page.nextCursor === null
+        ? ""
+        : `\nNext cursor: ${result.page.nextCursor}`
+    }\n`,
+  };
+}
+
 interface ParsedOptions {
   readonly json: boolean;
   readonly objectiveFile: string | null;
+  readonly limit: number | null;
+  readonly cursor: string | null;
+  readonly yes: boolean;
   readonly positional: string[];
 }
 
-function parseOptions(argv: string[], allowObjectiveFile: boolean): ParsedOptions {
+interface AllowedOptions {
+  readonly objectiveFile?: boolean;
+  readonly pagination?: boolean;
+  readonly yes?: boolean;
+}
+
+function parseOptions(
+  argv: string[],
+  allowed: AllowedOptions = {},
+): ParsedOptions {
   let json = false;
   let objectiveFile: string | null = null;
+  let limit: number | null = null;
+  let cursor: string | null = null;
+  let yes = false;
   const positional: string[] = [];
+
+  const takeValue = (index: number, option: string): string => {
+    const value = argv[index + 1];
+    if (value === undefined || value.startsWith("--")) {
+      throw new CliUsageError(`${option} requires a value.`);
+    }
+    return value;
+  };
 
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index]!;
@@ -161,25 +262,68 @@ function parseOptions(argv: string[], allowObjectiveFile: boolean): ParsedOption
       json = true;
       continue;
     }
-    if (argument === "--objective-file") {
-      if (!allowObjectiveFile) {
-        throw new CliUsageError("--objective-file is valid only for goal start.");
+    if (argument === "--yes") {
+      if (!allowed.yes) {
+        throw new CliUsageError("--yes is valid only for goal delete.");
       }
-      const path = argv[index + 1];
-      if (path === undefined) {
-        throw new CliUsageError("--objective-file requires a path.");
-      }
-      objectiveFile = path;
-      index += 1;
+      yes = true;
       continue;
     }
-    if (argument.startsWith("--objective-file=")) {
-      if (!allowObjectiveFile) {
+    if (
+      argument === "--objective-file" ||
+      argument.startsWith("--objective-file=")
+    ) {
+      if (!allowed.objectiveFile) {
         throw new CliUsageError("--objective-file is valid only for goal start.");
       }
-      objectiveFile = argument.slice("--objective-file=".length);
+      if (objectiveFile !== null) {
+        throw new CliUsageError("--objective-file may be provided only once.");
+      }
+      objectiveFile = argument.includes("=")
+        ? argument.slice("--objective-file=".length)
+        : takeValue(index, "--objective-file");
+      if (!argument.includes("=")) index += 1;
       if (objectiveFile.length === 0) {
         throw new CliUsageError("--objective-file requires a path.");
+      }
+      continue;
+    }
+    if (argument === "--limit" || argument.startsWith("--limit=")) {
+      if (!allowed.pagination) {
+        throw new CliUsageError("--limit is valid only for goal history.");
+      }
+      if (limit !== null) {
+        throw new CliUsageError("--limit may be provided only once.");
+      }
+      const raw = argument.includes("=")
+        ? argument.slice("--limit=".length)
+        : takeValue(index, "--limit");
+      if (!argument.includes("=")) index += 1;
+      limit = Number(raw);
+      if (
+        !Number.isInteger(limit) ||
+        limit < 1 ||
+        limit > GOAL_HISTORY_MAX_LIMIT
+      ) {
+        throw new CliUsageError(
+          `--limit must be an integer between 1 and ${GOAL_HISTORY_MAX_LIMIT}.`,
+        );
+      }
+      continue;
+    }
+    if (argument === "--cursor" || argument.startsWith("--cursor=")) {
+      if (!allowed.pagination) {
+        throw new CliUsageError("--cursor is valid only for goal history.");
+      }
+      if (cursor !== null) {
+        throw new CliUsageError("--cursor may be provided only once.");
+      }
+      cursor = argument.includes("=")
+        ? argument.slice("--cursor=".length)
+        : takeValue(index, "--cursor");
+      if (!argument.includes("=")) index += 1;
+      if (cursor.length === 0) {
+        throw new CliUsageError("--cursor requires a value.");
       }
       continue;
     }
@@ -189,7 +333,7 @@ function parseOptions(argv: string[], allowObjectiveFile: boolean): ParsedOption
     positional.push(argument);
   }
 
-  return { json, objectiveFile, positional };
+  return { json, objectiveFile, limit, cursor, yes, positional };
 }
 
 function resolveThreadId(
@@ -247,12 +391,17 @@ async function readObjectiveFile(
     : file.content;
 }
 
-function publishGoalChanged(bb: BbPluginApi, goal: GoalDto): void {
+function publishGoalChanged(
+  bb: BbPluginApi,
+  goal: GoalDto,
+  deleted = false,
+): void {
   bb.realtime.publish(GOAL_REALTIME_CHANNEL, {
     threadId: goal.threadId,
     goalId: goal.id,
     revision: goal.revision,
     state: goal.state,
+    deleted,
   });
 }
 
@@ -262,7 +411,7 @@ async function runStart(
   argv: string[],
   ctx: PluginCliContext,
 ): Promise<PluginCliResult> {
-  const options = parseOptions(argv, true);
+  const options = parseOptions(argv, { objectiveFile: true });
   const firstIsThread = options.positional[0]?.startsWith("thr_") ?? false;
   const explicitThread = firstIsThread ? options.positional[0] : undefined;
   const objectiveWords = options.positional.slice(firstIsThread ? 1 : 0);
@@ -284,7 +433,9 @@ async function runStart(
       ? objectiveWords.join(" ")
       : await readObjectiveFile(bb, options.objectiveFile, ctx);
   const result = await runtime.run({ type: "start", threadId, objective });
-  if (result.ok && result.goal !== null) publishGoalChanged(bb, result.goal);
+  if (result.ok && "goal" in result && result.goal !== null) {
+    publishGoalChanged(bb, result.goal);
+  }
   return commandResult(
     result,
     options.json,
@@ -298,7 +449,7 @@ async function runStatus(
   argv: string[],
   ctx: PluginCliContext,
 ): Promise<PluginCliResult> {
-  const options = parseOptions(argv, false);
+  const options = parseOptions(argv);
   if (options.positional.length > 1) {
     throw new CliUsageError("Usage: bb goal status [thread-id] [--json]");
   }
@@ -329,7 +480,7 @@ async function runMutation(
   argv: string[],
   ctx: PluginCliContext,
 ): Promise<PluginCliResult> {
-  const options = parseOptions(argv, false);
+  const options = parseOptions(argv);
   const firstIsThread = options.positional[0]?.startsWith("thr_") ?? false;
   const explicitThread = firstIsThread ? options.positional[0] : undefined;
   const remaining = options.positional.slice(firstIsThread ? 1 : 0);
@@ -347,6 +498,9 @@ async function runMutation(
   const threadId = resolveThreadId(explicitThread, ctx);
   const status = await runtime.run({ type: "status", threadId });
   if (!status.ok) return commandResult(status, options.json, "", "");
+  if (!("goal" in status)) {
+    return { exitCode: 1, stderr: "Goal status returned invalid output.\n" };
+  }
   if (status.goal === null) {
     return commandResult(missingCurrentGoal(threadId), options.json, "", "");
   }
@@ -364,7 +518,9 @@ async function runMutation(
           objective: remaining.join(" "),
         })
       : await runtime.run({ type, ...guard });
-  if (result.ok && result.goal !== null) publishGoalChanged(bb, result.goal);
+  if (result.ok && "goal" in result && result.goal !== null) {
+    publishGoalChanged(bb, result.goal);
+  }
 
   const headings: Record<GoalMutationType, string> = {
     edit: "Edited Goal",
@@ -373,6 +529,77 @@ async function runMutation(
     cancel: "Canceled Goal",
   };
   return commandResult(result, options.json, headings[type], "");
+}
+
+async function runHistory(
+  runtime: GoalRuntime,
+  argv: string[],
+  ctx: PluginCliContext,
+): Promise<PluginCliResult> {
+  const options = parseOptions(argv, { pagination: true });
+  if (options.positional.length > 1) {
+    throw new CliUsageError(
+      "Usage: bb goal history [thread-id] [--limit <n>] [--cursor <cursor>] [--json]",
+    );
+  }
+  const threadId = resolveThreadId(options.positional[0], ctx);
+  const result = await runtime.run({
+    type: "history",
+    threadId,
+    limit: options.limit ?? GOAL_HISTORY_DEFAULT_LIMIT,
+    cursor: options.cursor,
+  });
+  return historyResult(result, options.json, threadId);
+}
+
+async function runShow(
+  runtime: GoalRuntime,
+  argv: string[],
+): Promise<PluginCliResult> {
+  const options = parseOptions(argv);
+  if (options.positional.length !== 1) {
+    throw new CliUsageError("Usage: bb goal show <goal-id> [--json]");
+  }
+  const result = await runtime.run({
+    type: "show",
+    goalId: options.positional[0]!,
+  });
+  return commandResult(result, options.json, "Goal", "");
+}
+
+async function runDelete(
+  bb: BbPluginApi,
+  runtime: GoalRuntime,
+  argv: string[],
+): Promise<PluginCliResult> {
+  const options = parseOptions(argv, { yes: true });
+  if (options.positional.length !== 1) {
+    throw new CliUsageError(
+      "Usage: bb goal delete <goal-id> --yes [--json]",
+    );
+  }
+  if (!options.yes) {
+    throw new CliUsageError("Deleting a Goal requires --yes.");
+  }
+
+  const shown = await runtime.run({
+    type: "show",
+    goalId: options.positional[0]!,
+  });
+  if (!shown.ok) return commandResult(shown, options.json, "", "");
+  if (!("goal" in shown) || shown.goal === null) {
+    return { exitCode: 1, stderr: "Goal show returned invalid output.\n" };
+  }
+  const result = await runtime.run({
+    type: "delete",
+    threadId: shown.goal.threadId,
+    goalId: shown.goal.id,
+    expectedRevision: shown.goal.revision,
+  });
+  if (result.ok && "goal" in result && result.goal !== null) {
+    publishGoalChanged(bb, result.goal, true);
+  }
+  return commandResult(result, options.json, "Deleted Goal", "");
 }
 
 async function runCli(
@@ -386,6 +613,9 @@ async function runCli(
     const [command, ...rest] = argv;
     if (command === "start") return await runStart(bb, runtime, rest, ctx);
     if (command === "status") return await runStatus(runtime, rest, ctx);
+    if (command === "history") return await runHistory(runtime, rest, ctx);
+    if (command === "show") return await runShow(runtime, rest);
+    if (command === "delete") return await runDelete(bb, runtime, rest);
     if (
       command === "edit" ||
       command === "pause" ||
@@ -395,7 +625,7 @@ async function runCli(
       return await runMutation(bb, runtime, command, rest, ctx);
     }
     throw new CliUsageError(
-      "Usage: bb goal <start|status|edit|pause|resume|cancel> ...",
+      "Usage: bb goal <start|status|edit|pause|resume|cancel|history|show|delete> ...",
     );
   } catch (cause) {
     const message = cause instanceof Error ? cause.message : String(cause);
@@ -451,15 +681,17 @@ export function createPlugin(
             readonly expectedRevision: number;
           },
     ): Promise<{ goal: GoalDto }> {
-      const goal = requireSuccessful(await runtime.run(command));
-      if (goal === null) throw new Error(`Goal ${command.type} returned no Goal.`);
+      const goal = requireGoalSuccessful(await runtime.run(command));
+      if (goal === null) {
+        throw new Error(`Goal ${command.type} returned no Goal.`);
+      }
       publishGoalChanged(bb, goal);
       return { goal };
     }
 
     bb.rpc.register(rpcContract, {
       async start(input) {
-        const goal = requireSuccessful(
+        const goal = requireGoalSuccessful(
           await runtime.run({
             type: "start",
             threadId: input.threadId,
@@ -471,7 +703,7 @@ export function createPlugin(
         return { goal };
       },
       async status(input) {
-        const goal = requireSuccessful(
+        const goal = requireGoalSuccessful(
           await runtime.run({ type: "status", threadId: input.threadId }),
         );
         return { goal };
@@ -480,6 +712,27 @@ export function createPlugin(
       pause: (input) => mutate({ type: "pause", ...input }),
       resume: (input) => mutate({ type: "resume", ...input }),
       cancel: (input) => mutate({ type: "cancel", ...input }),
+      async history(input) {
+        const page = requireHistorySuccessful(
+          await runtime.run({ type: "history", ...input }),
+        );
+        return { goals: [...page.goals], nextCursor: page.nextCursor };
+      },
+      async show(input) {
+        const goal = requireGoalSuccessful(
+          await runtime.run({ type: "show", goalId: input.goalId }),
+        );
+        if (goal === null) throw new Error("Goal show returned no Goal.");
+        return { goal };
+      },
+      async delete(input) {
+        const goal = requireGoalSuccessful(
+          await runtime.run({ type: "delete", ...input }),
+        );
+        if (goal === null) throw new Error("Goal delete returned no Goal.");
+        publishGoalChanged(bb, goal, true);
+        return { goal };
+      },
     });
 
     bb.cli.register({
@@ -516,6 +769,22 @@ export function createPlugin(
           name: "cancel",
           summary: "Cancel an unfinished Goal",
           usage: "bb goal cancel [thread-id] [--json]",
+        },
+        {
+          name: "history",
+          summary: "Browse a thread's Goal history",
+          usage:
+            "bb goal history [thread-id] [--limit <n>] [--cursor <cursor>] [--json]",
+        },
+        {
+          name: "show",
+          summary: "Inspect one Goal by ID",
+          usage: "bb goal show <goal-id> [--json]",
+        },
+        {
+          name: "delete",
+          summary: "Delete one Goal after explicit confirmation",
+          usage: "bb goal delete <goal-id> --yes [--json]",
         },
       ],
       run: (argv, ctx) => runCli(bb, runtime, argv, ctx),

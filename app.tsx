@@ -8,6 +8,7 @@ import {
 import {
   definePluginApp,
   useBbContext,
+  useBbNavigate,
   useRealtime,
   useRealtimeConnectionState,
   useRpc,
@@ -44,6 +45,15 @@ type ViewState =
   | { readonly kind: "current"; readonly goal: GoalView }
   | { readonly kind: "error"; readonly message: string };
 
+type HistoryViewState =
+  | { readonly kind: "loading" }
+  | { readonly kind: "error"; readonly message: string }
+  | {
+      readonly kind: "ready";
+      readonly goals: readonly GoalView[];
+      readonly nextCursor: string | null;
+    };
+
 function messageFromCause(cause: unknown): string {
   return cause instanceof Error ? cause.message : "Goal could not be loaded.";
 }
@@ -65,9 +75,231 @@ function goalStateLabel(state: GoalState): string {
   }
 }
 
+export function GoalHistoryPanel({ threadId }: { readonly threadId: string }) {
+  const rpc = useRpc<typeof rpcContract>();
+  const connectionState = useRealtimeConnectionState();
+  const previousConnectionState = useRef(connectionState);
+  const [view, setView] = useState<HistoryViewState>({ kind: "loading" });
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [confirming, setConfirming] = useState<GoalView | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      const page = await rpc.call("history", {
+        threadId,
+        limit: 20,
+        cursor: null,
+      });
+      setView({ kind: "ready", ...page });
+      setConfirming(null);
+      setActionError(null);
+    } catch (cause) {
+      setView({ kind: "error", message: messageFromCause(cause) });
+    }
+  }, [rpc, threadId]);
+
+  useEffect(() => {
+    setView({ kind: "loading" });
+    void load();
+  }, [load]);
+
+  useEffect(() => {
+    const previous = previousConnectionState.current;
+    previousConnectionState.current = connectionState;
+    if (connectionState === "connected" && previous !== "connected") {
+      void load();
+    }
+  }, [connectionState, load]);
+
+  useRealtime(GOAL_REALTIME_CHANNEL, (payload) => {
+    if (
+      typeof payload === "object" &&
+      payload !== null &&
+      "threadId" in payload &&
+      payload.threadId === threadId
+    ) {
+      void load();
+    }
+  });
+
+  async function loadMore() {
+    if (view.kind !== "ready" || view.nextCursor === null) return;
+    setLoadingMore(true);
+    setActionError(null);
+    try {
+      const page = await rpc.call("history", {
+        threadId,
+        limit: 20,
+        cursor: view.nextCursor,
+      });
+      setView({
+        kind: "ready",
+        goals: [...view.goals, ...page.goals],
+        nextCursor: page.nextCursor,
+      });
+    } catch (cause) {
+      setActionError(messageFromCause(cause));
+    } finally {
+      setLoadingMore(false);
+    }
+  }
+
+  async function deleteGoal(goal: GoalView) {
+    setDeletingId(goal.id);
+    setActionError(null);
+    try {
+      await rpc.call("delete", {
+        threadId,
+        goalId: goal.id,
+        expectedRevision: goal.revision,
+      });
+      await load();
+    } catch (cause) {
+      setActionError(messageFromCause(cause));
+    } finally {
+      setDeletingId(null);
+    }
+  }
+
+  if (view.kind === "loading") {
+    return (
+      <div className="text-sm text-muted-foreground" role="status">
+        Loading Goal history
+      </div>
+    );
+  }
+
+  if (view.kind === "error") {
+    return (
+      <div className="space-y-3 text-sm">
+        <p className="text-destructive">{view.message}</p>
+        <Button size="sm" variant="outline" onClick={() => void load()}>
+          Retry
+        </Button>
+      </div>
+    );
+  }
+
+  return (
+    <section aria-label="Goal history" className="space-y-4 text-sm">
+      <header>
+        <h2 className="font-medium text-foreground">Goal history</h2>
+        <p className="mt-1 text-muted-foreground">
+          Newest first. Current and finished objectives stay with this thread.
+        </p>
+      </header>
+
+      {view.goals.length === 0 ? (
+        <div className="rounded-lg border border-dashed border-border p-4 text-muted-foreground">
+          No Goals have been recorded for this thread.
+        </div>
+      ) : (
+        <ol className="space-y-3">
+          {view.goals.map((goal) => {
+            const deleting = deletingId === goal.id;
+            const isConfirming = confirming?.id === goal.id;
+            return (
+              <li
+                key={goal.id}
+                className="rounded-lg border border-border bg-card p-3"
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="font-medium text-foreground">
+                        {goalStateLabel(goal.state)}
+                      </span>
+                      <span className="rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground">
+                        {goal.finishedAt === null ? "Current" : "Historical"}
+                      </span>
+                    </div>
+                    <p className="mt-2 whitespace-pre-wrap text-foreground">
+                      {goal.objective}
+                    </p>
+                    <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
+                      <code>{goal.id}</code>
+                      <span>Revision {goal.revision}</span>
+                      <time dateTime={goal.createdAt}>{goal.createdAt}</time>
+                    </div>
+                  </div>
+                  {!isConfirming ? (
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      disabled={deletingId !== null}
+                      onClick={() => {
+                        setConfirming(goal);
+                        setActionError(null);
+                      }}
+                    >
+                      Delete
+                    </Button>
+                  ) : null}
+                </div>
+
+                {isConfirming ? (
+                  <div
+                    className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-border pt-3"
+                    role="alert"
+                  >
+                    <span className="text-destructive">
+                      Delete this Goal permanently?
+                    </span>
+                    <div className="flex gap-1">
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        disabled={deleting}
+                        onClick={() => setConfirming(null)}
+                      >
+                        Keep Goal
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="destructive"
+                        disabled={deleting}
+                        onClick={() => void deleteGoal(goal)}
+                      >
+                        {deleting ? "Deleting" : "Confirm delete"}
+                      </Button>
+                    </div>
+                  </div>
+                ) : null}
+              </li>
+            );
+          })}
+        </ol>
+      )}
+
+      {view.nextCursor !== null ? (
+        <Button
+          size="sm"
+          variant="outline"
+          disabled={loadingMore}
+          onClick={() => void loadMore()}
+        >
+          {loadingMore ? "Loading" : "Load older Goals"}
+        </Button>
+      ) : null}
+
+      {actionError !== null ? (
+        <div className="flex items-center justify-between gap-3 text-destructive">
+          <span>{actionError}</span>
+          <Button size="sm" variant="ghost" onClick={() => void load()}>
+            Refresh
+          </Button>
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
 export function GoalComposerRow() {
   const { threadId } = useBbContext();
   const rpc = useRpc<typeof rpcContract>();
+  const navigate = useBbNavigate();
   const connectionState = useRealtimeConnectionState();
   const previousConnectionState = useRef(connectionState);
   const [view, setView] = useState<ViewState>({ kind: "loading" });
@@ -187,6 +419,16 @@ export function GoalComposerRow() {
     }
   }
 
+  function openHistory() {
+    const opened = navigate.openThreadPanel({
+      actionId: "history",
+      title: "Goal history",
+    });
+    if (!opened) {
+      setActionError("Goal history is unavailable in this view.");
+    }
+  }
+
   const busy = pending !== null;
 
   return (
@@ -209,9 +451,18 @@ export function GoalComposerRow() {
               No unfinished objective
             </span>
           </div>
-          <Button size="sm" variant="outline" onClick={() => setStarting(true)}>
-            Start Goal
-          </Button>
+          <div className="flex shrink-0 items-center gap-1">
+            <Button size="sm" variant="ghost" onClick={openHistory}>
+              History
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => setStarting(true)}
+            >
+              Start Goal
+            </Button>
+          </div>
         </div>
       ) : null}
 
@@ -309,6 +560,14 @@ export function GoalComposerRow() {
               size="sm"
               variant="ghost"
               disabled={busy}
+              onClick={openHistory}
+            >
+              History
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              disabled={busy}
               onClick={() => {
                 setObjective(view.goal.objective);
                 setEditing(true);
@@ -371,6 +630,13 @@ export function GoalComposerRow() {
 }
 
 export default definePluginApp((app) => {
+  app.slots.threadPanelAction({
+    id: "history",
+    title: "Goal history",
+    icon: "History",
+    component: GoalHistoryPanel,
+  });
+
   app.composer.customize({
     id: "goal-row",
     scopes: ["thread"],
