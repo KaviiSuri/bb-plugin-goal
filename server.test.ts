@@ -201,6 +201,57 @@ describe("Goal BB adapter", () => {
     }
   });
 
+  it("withholds Goal context while paused and restores the resumed revision", async () => {
+    const { bb, harness } = fakeHost();
+    await deterministicPlugin()(bb);
+    try {
+      const started = (await harness.behavior.callRpc("start", {
+        threadId: "thr_agent",
+        objective: "Pause before continuing",
+      })) as { goal: GoalDto };
+      const paused = (await harness.behavior.callRpc("pause", {
+        threadId: "thr_agent",
+        goalId: started.goal.id,
+        expectedRevision: started.goal.revision,
+      })) as { goal: GoalDto };
+      expect(paused.goal).toMatchObject({ state: "paused", revision: 2 });
+
+      await expect(
+        harness.behavior.resolveAgentConfiguration(agentContext("pi")),
+      ).resolves.toEqual({ tools: [], skills: [], instructions: null });
+
+      const resumed = (await harness.behavior.callRpc("resume", {
+        threadId: "thr_agent",
+        goalId: paused.goal.id,
+        expectedRevision: paused.goal.revision,
+      })) as { goal: GoalDto };
+      expect(resumed.goal).toMatchObject({ state: "active", revision: 3 });
+
+      const configuration =
+        await harness.behavior.resolveAgentConfiguration(
+          agentContext("codex"),
+        );
+      expect(configuration.instructions).toContain(
+        `Exact Goal ID: ${resumed.goal.id}`,
+      );
+      expect(configuration.instructions).toContain("Goal revision: 3");
+      expect(configuration.instructions).toContain("Pause before continuing");
+      expect(configuration.tools).toMatchObject([
+        {
+          name: "goal_complete",
+          inputSchema: {
+            properties: {
+              goalId: { const: resumed.goal.id },
+              expectedRevision: { const: 3 },
+            },
+          },
+        },
+      ]);
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
   it("guards agent Completion end to end and publishes plain terminal DTOs", async () => {
     const { bb, harness } = fakeHost();
     await deterministicPlugin()(bb);
