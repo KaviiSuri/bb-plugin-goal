@@ -8,6 +8,7 @@ import {
   GoalPersistenceError,
   GoalRecordNotFound,
   GoalStaleGuard,
+  type GoalBlockedCommand,
   type GoalCompletionCommand,
   type GoalDto,
   type GoalGuardedAction,
@@ -57,6 +58,9 @@ export const GOAL_MIGRATIONS = [
       ON goal_history_order(thread_id, sequence DESC)`,
   `ALTER TABLE goals ADD COLUMN completion_summary TEXT;
    ALTER TABLE goals ADD COLUMN verification_evidence TEXT`,
+  `ALTER TABLE goals ADD COLUMN blockage_external_action TEXT;
+   ALTER TABLE goals ADD COLUMN blockage_evidence TEXT;
+   ALTER TABLE goals ADD COLUMN blockage_repeated_turns INTEGER`,
 ] as const;
 
 export function migrateGoalDatabase(database: BetterSqlite3.Database): void {
@@ -76,7 +80,10 @@ interface StartGoalRecord {
 }
 
 export interface MutateGoalRecord {
-  readonly command: GoalMutationCommand | GoalCompletionCommand;
+  readonly command:
+    | GoalMutationCommand
+    | GoalCompletionCommand
+    | GoalBlockedCommand;
   readonly now: string;
 }
 
@@ -139,6 +146,9 @@ type GoalRow = {
   readonly finishedAt: string | null;
   readonly completionSummary: string | null;
   readonly verificationEvidence: string | null;
+  readonly blockageExternalAction: string | null;
+  readonly blockageEvidence: string | null;
+  readonly blockageRepeatedTurns: number | null;
 };
 
 type GoalHistoryRow = GoalRow & { readonly historySequence: number };
@@ -154,6 +164,7 @@ function permitsMutation(goal: GoalDto, action: GoalGuardedAction): boolean {
       return goal.finishedAt === null;
     case "pause":
     case "complete":
+    case "block":
       return goal.state === "active";
     case "resume":
       return goal.state === "paused";
@@ -192,7 +203,10 @@ const goalColumns = `SELECT
     updated_at AS updatedAt,
     finished_at AS finishedAt,
     completion_summary AS completionSummary,
-    verification_evidence AS verificationEvidence
+    verification_evidence AS verificationEvidence,
+    blockage_external_action AS blockageExternalAction,
+    blockage_evidence AS blockageEvidence,
+    blockage_repeated_turns AS blockageRepeatedTurns
   FROM goals`;
 
 export interface CurrentGoalSnapshotReader {
@@ -235,6 +249,9 @@ export function makeGoalRepositoryLayer(
           goals.finished_at AS finishedAt,
           goals.completion_summary AS completionSummary,
           goals.verification_evidence AS verificationEvidence,
+          goals.blockage_external_action AS blockageExternalAction,
+          goals.blockage_evidence AS blockageEvidence,
+          goals.blockage_repeated_turns AS blockageRepeatedTurns,
           goal_history_order.sequence AS historySequence
         FROM goals
         INNER JOIN goal_history_order
@@ -304,6 +321,14 @@ export function makeGoalRepositoryLayer(
           SET state = 'completed', revision = revision + 1,
             updated_at = ?, finished_at = ?, completion_summary = ?,
             verification_evidence = ?
+          WHERE id = ? AND thread_id = ? AND revision = ?
+            AND state = 'active' AND finished_at IS NULL`,
+      );
+      const block = database.prepare(
+        `UPDATE goals
+          SET state = 'blocked', revision = revision + 1,
+            updated_at = ?, finished_at = ?, blockage_external_action = ?,
+            blockage_evidence = ?, blockage_repeated_turns = ?
           WHERE id = ? AND thread_id = ? AND revision = ?
             AND state = 'active' AND finished_at IS NULL`,
       );
@@ -426,6 +451,17 @@ export function makeGoalRepositoryLayer(
                   now,
                   command.summary,
                   command.verificationEvidence,
+                  command.goalId,
+                  command.threadId,
+                  command.expectedRevision,
+                );
+              case "block":
+                return block.run(
+                  now,
+                  now,
+                  command.externalAction,
+                  command.evidence,
+                  command.repeatedTurns,
                   command.goalId,
                   command.threadId,
                   command.expectedRevision,

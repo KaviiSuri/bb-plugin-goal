@@ -39,6 +39,9 @@ interface GoalView {
   readonly finishedAt: string | null;
   readonly completionSummary: string | null;
   readonly verificationEvidence: string | null;
+  readonly blockageExternalAction: string | null;
+  readonly blockageEvidence: string | null;
+  readonly blockageRepeatedTurns: number | null;
 }
 
 type ViewState =
@@ -233,6 +236,25 @@ export function GoalHistoryPanel({ threadId }: { readonly threadId: string }) {
                         </p>
                         <p className="mt-1 whitespace-pre-wrap text-muted-foreground">
                           {goal.verificationEvidence}
+                        </p>
+                      </div>
+                    ) : null}
+                    {goal.blockageExternalAction !== null ? (
+                      <div className="mt-3 rounded-md bg-muted/50 p-2 text-sm">
+                        <p className="font-medium text-foreground">
+                          External action required
+                        </p>
+                        <p className="mt-1 whitespace-pre-wrap text-muted-foreground">
+                          {goal.blockageExternalAction}
+                        </p>
+                        <p className="mt-2 font-medium text-foreground">
+                          Blockage evidence
+                        </p>
+                        <p className="mt-1 whitespace-pre-wrap text-muted-foreground">
+                          {goal.blockageEvidence}
+                        </p>
+                        <p className="mt-2 text-xs text-muted-foreground">
+                          Same blocker reported for {goal.blockageRepeatedTurns} Goal turns
                         </p>
                       </div>
                     ) : null}

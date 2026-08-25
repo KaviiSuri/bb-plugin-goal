@@ -103,6 +103,7 @@ describe("Goal BB adapter", () => {
       ]);
       expect(harness.inspection.registrations.agentTools).toMatchObject([
         { name: "goal_complete" },
+        { name: "goal_blocked" },
       ]);
       expect(
         harness.inspection.registrations.agentConfigurationProvider,
@@ -178,7 +179,7 @@ describe("Goal BB adapter", () => {
           "Call goal_complete only after every requirement is satisfied and verified.",
         );
         expect(configuration.instructions!.length).toBeLessThanOrEqual(4096);
-        expect(configuration.tools).toHaveLength(1);
+        expect(configuration.tools).toHaveLength(2);
         expect(configuration.tools[0]).toMatchObject({
           name: "goal_complete",
           inputSchema: {
@@ -187,6 +188,16 @@ describe("Goal BB adapter", () => {
             properties: {
               goalId: { const: "goal_agent" },
               expectedRevision: { const: 1 },
+            },
+          },
+        });
+        expect(configuration.tools[1]).toMatchObject({
+          name: "goal_blocked",
+          inputSchema: {
+            properties: {
+              goalId: { const: "goal_agent" },
+              expectedRevision: { const: 1 },
+              repeatedTurns: { minimum: 3 },
             },
           },
         });
@@ -239,6 +250,15 @@ describe("Goal BB adapter", () => {
       expect(configuration.tools).toMatchObject([
         {
           name: "goal_complete",
+          inputSchema: {
+            properties: {
+              goalId: { const: resumed.goal.id },
+              expectedRevision: { const: 3 },
+            },
+          },
+        },
+        {
+          name: "goal_blocked",
           inputSchema: {
             properties: {
               goalId: { const: resumed.goal.id },
@@ -412,6 +432,145 @@ describe("Goal BB adapter", () => {
       expect(shown.stdout).toContain(
         "Verification evidence: Coordinator and fake-host tests pass.",
       );
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
+  it("guards agent Blockage and exposes its evidence across host boundaries", async () => {
+    const { bb, harness } = fakeHost();
+    await deterministicPlugin()(bb);
+    try {
+      const started = (await harness.behavior.callRpc("start", {
+        threadId: "thr_blocked",
+        objective: "reach the external dependency",
+      })) as { goal: GoalDto };
+
+      await expect(
+        harness.behavior.callAgentTool(
+          "goal_blocked",
+          {
+            goalId: started.goal.id,
+            expectedRevision: 1,
+            externalAction: "User must provide a credential",
+            evidence: "The provider rejected the request",
+            repeatedTurns: 2,
+          },
+          { threadId: "thr_blocked" },
+        ),
+      ).rejects.toThrow(/repeatedTurns/);
+
+      await expect(
+        harness.behavior.callAgentTool(
+          "goal_blocked",
+          {
+            goalId: "goal_wrong",
+            expectedRevision: 1,
+            externalAction: "User must provide a credential",
+            evidence: "The provider rejected the request",
+            repeatedTurns: 3,
+          },
+          { threadId: "thr_blocked" },
+        ),
+      ).rejects.toThrow("[goal_not_found]");
+
+      await expect(
+        harness.behavior.callAgentTool(
+          "goal_blocked",
+          {
+            goalId: started.goal.id,
+            expectedRevision: 1,
+            externalAction: "User must provide a credential",
+            evidence: "The provider rejected the request",
+            repeatedTurns: 2,
+          },
+          { threadId: "thr_blocked" },
+        ),
+      ).rejects.toThrow(/repeatedTurns/);
+
+      const edited = (await harness.behavior.callRpc("edit", {
+        threadId: "thr_blocked",
+        goalId: started.goal.id,
+        expectedRevision: 1,
+        objective: "reach the external dependency with evidence",
+      })) as { goal: GoalDto };
+      await expect(
+        harness.behavior.callAgentTool(
+          "goal_blocked",
+          {
+            goalId: edited.goal.id,
+            expectedRevision: 1,
+            externalAction: "User must provide a credential",
+            evidence: "Stale blocker evidence",
+            repeatedTurns: 3,
+          },
+          { threadId: "thr_blocked" },
+        ),
+      ).rejects.toThrow("[stale_goal]");
+
+      const toolResult = await harness.behavior.callAgentTool(
+        "goal_blocked",
+        {
+          goalId: edited.goal.id,
+          expectedRevision: edited.goal.revision,
+          externalAction: "  User must provide a credential  ",
+          evidence: "  Provider rejected all three attempts with credential_missing.  ",
+          repeatedTurns: 3,
+        },
+        { threadId: "thr_blocked" },
+      );
+      if (typeof toolResult === "string") {
+        throw new Error("Expected a structured tool result");
+      }
+      const content = toolResult.content[0];
+      if (content?.type !== "text") {
+        throw new Error("Expected text tool content");
+      }
+      expect(JSON.parse(content.text)).toMatchObject({
+        goal: {
+          id: edited.goal.id,
+          state: "blocked",
+          revision: 3,
+          blockageExternalAction: "User must provide a credential",
+          blockageEvidence:
+            "Provider rejected all three attempts with credential_missing.",
+          blockageRepeatedTurns: 3,
+        },
+      });
+      expect(harness.inspection.realtimeSignals.at(-1)).toMatchObject({
+        channel: "goal.changed",
+        payload: {
+          threadId: "thr_blocked",
+          goalId: edited.goal.id,
+          revision: 3,
+          state: "blocked",
+        },
+      });
+      await expect(
+        harness.behavior.callRpc("history", {
+          threadId: "thr_blocked",
+          limit: 20,
+          cursor: null,
+        }),
+      ).resolves.toMatchObject({
+        goals: [
+          {
+            state: "blocked",
+            blockageExternalAction: "User must provide a credential",
+            blockageEvidence:
+              "Provider rejected all three attempts with credential_missing.",
+            blockageRepeatedTurns: 3,
+          },
+        ],
+      });
+      const shown = await harness.behavior.runCli([
+        "show",
+        edited.goal.id,
+      ]);
+      expect(shown.stdout).toContain(
+        "External action required: User must provide a credential",
+      );
+      expect(shown.stdout).toContain("Repeated blocker turns: 3");
     } finally {
       await harness.lifecycle.dispose();
     }

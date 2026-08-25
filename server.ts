@@ -36,6 +36,9 @@ const goalSchema = z
     finishedAt: z.string().nullable(),
     completionSummary: z.string().nullable(),
     verificationEvidence: z.string().nullable(),
+    blockageExternalAction: z.string().nullable(),
+    blockageEvidence: z.string().nullable(),
+    blockageRepeatedTurns: z.number().int().nullable(),
   })
   .strict();
 
@@ -45,6 +48,16 @@ export const goalCompleteInputSchema = z
     expectedRevision: z.number().int().positive(),
     summary: z.string().trim().min(1),
     verificationEvidence: z.string().trim().min(1),
+  })
+  .strict();
+
+export const goalBlockedInputSchema = z
+  .object({
+    goalId: z.string().min(1),
+    expectedRevision: z.number().int().positive(),
+    externalAction: z.string().trim().min(1),
+    evidence: z.string().trim().min(1),
+    repeatedTurns: z.number().int().min(3),
   })
   .strict();
 
@@ -153,6 +166,15 @@ function formatGoal(goal: GoalDto, heading: string): string {
     ...(goal.verificationEvidence === null
       ? []
       : [`Verification evidence: ${goal.verificationEvidence}`]),
+    ...(goal.blockageExternalAction === null
+      ? []
+      : [`External action required: ${goal.blockageExternalAction}`]),
+    ...(goal.blockageEvidence === null
+      ? []
+      : [`Blockage evidence: ${goal.blockageEvidence}`]),
+    ...(goal.blockageRepeatedTurns === null
+      ? []
+      : [`Repeated blocker turns: ${goal.blockageRepeatedTurns}`]),
   ].join("\n");
 }
 
@@ -167,6 +189,7 @@ function resultExitCode(result: GoalCommandResult): number {
     case "invalid_cursor":
     case "invalid_objective":
     case "invalid_completion":
+    case "invalid_blockage":
       return 2;
     case "thread_not_found":
     case "goal_not_found":
@@ -420,7 +443,8 @@ function goalAgentInstructions(goal: GoalDto): string {
     "Keep working until the full objective is complete. Do not stop after only a plan or partial progress.",
     "Only the user may edit, pause, resume, cancel, or delete this Goal.",
     "Call goal_complete only after every requirement is satisfied and verified. Pass the exact Goal ID and revision shown here, a concrete completion summary, and verification evidence.",
-    "A stale Goal ID or revision cannot complete an edited, terminal, or replacement Goal.",
+    "Call goal_blocked only for a genuine external impasse that requires a user or external action. Do not use it for ordinary difficulty, uncertainty, provider failures, usage limits, pending interactions, or a blocker that changed. The same external blocker must persist for at least three consecutive Goal turns. Pass the exact Goal ID and revision, the required external action, concrete evidence, and the repeated-turn count.",
+    "A stale Goal ID or revision cannot complete or block an edited, terminal, or replacement Goal.",
     "Objective:",
   ].join("\n");
   const maxLength = 4096;
@@ -451,6 +475,27 @@ function goalCompleteParameters(goal: GoalDto): Record<string, unknown> {
       expectedRevision: { type: "integer", const: goal.revision },
       summary: { type: "string", minLength: 1 },
       verificationEvidence: { type: "string", minLength: 1 },
+    },
+  };
+}
+
+function goalBlockedParameters(goal: GoalDto): Record<string, unknown> {
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: [
+      "goalId",
+      "expectedRevision",
+      "externalAction",
+      "evidence",
+      "repeatedTurns",
+    ],
+    properties: {
+      goalId: { type: "string", const: goal.id },
+      expectedRevision: { type: "integer", const: goal.revision },
+      externalAction: { type: "string", minLength: 1 },
+      evidence: { type: "string", minLength: 1 },
+      repeatedTurns: { type: "integer", minimum: 3 },
     },
   };
 }
@@ -762,6 +807,38 @@ export function createPlugin(
       },
     });
 
+    bb.agents.registerTool({
+      name: "goal_blocked",
+      description:
+        "Report a genuine external Blockage after the same blocker persists for at least three consecutive Goal turns.",
+      instructions:
+        "Use only for a genuine external impasse. Include the exact Goal ID and revision, the required external action, concrete evidence, and the repeated-turn count. Do not use for ordinary difficulty, uncertainty, failures, usage limits, pending interactions, or changed blockers.",
+      experimental_statusLabels: {
+        pending: "Reporting Goal Blockage",
+        completed: "Reported Goal Blockage",
+      },
+      parameters: goalBlockedInputSchema,
+      async execute(input, context) {
+        const goal = requireGoalSuccessful(
+          await runtime.run({
+            type: "block",
+            threadId: context.threadId,
+            ...input,
+          }),
+        );
+        if (goal === null) throw new Error("Goal Blockage returned no Goal.");
+        publishGoalChanged(bb, goal);
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({ goal }),
+            },
+          ],
+        };
+      },
+    });
+
     bb.agents.configure((context) => {
       const goal = snapshots.current(context.thread.id);
       if (goal === null || goal.state !== "active") {
@@ -772,6 +849,10 @@ export function createPlugin(
           {
             name: "goal_complete",
             parameters: goalCompleteParameters(goal),
+          },
+          {
+            name: "goal_blocked",
+            parameters: goalBlockedParameters(goal),
           },
         ],
         skills: [],

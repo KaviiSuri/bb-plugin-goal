@@ -17,6 +17,7 @@ export type GoalMutationType = (typeof goalMutationTypes)[number];
 export const goalGuardedActionTypes = [
   ...goalMutationTypes,
   "complete",
+  "block",
 ] as const;
 export type GoalGuardedAction = (typeof goalGuardedActionTypes)[number];
 
@@ -34,6 +35,9 @@ export const GoalDtoSchema = Schema.Struct({
   finishedAt: Schema.NullOr(Schema.String),
   completionSummary: Schema.NullOr(Schema.String),
   verificationEvidence: Schema.NullOr(Schema.String),
+  blockageExternalAction: Schema.NullOr(Schema.String),
+  blockageEvidence: Schema.NullOr(Schema.String),
+  blockageRepeatedTurns: Schema.NullOr(Schema.Int),
 });
 
 export interface GoalDto {
@@ -47,6 +51,9 @@ export interface GoalDto {
   readonly finishedAt: string | null;
   readonly completionSummary: string | null;
   readonly verificationEvidence: string | null;
+  readonly blockageExternalAction: string | null;
+  readonly blockageEvidence: string | null;
+  readonly blockageRepeatedTurns: number | null;
 }
 
 export interface GoalHistoryPage {
@@ -93,6 +100,12 @@ export type GoalCommand =
       readonly verificationEvidence: string;
     })
   | (GuardedGoalCommand & {
+      readonly type: "block";
+      readonly externalAction: string;
+      readonly evidence: string;
+      readonly repeatedTurns: number;
+    })
+  | (GuardedGoalCommand & {
       readonly type: "delete";
     });
 
@@ -104,6 +117,11 @@ export type GoalMutationCommand = Extract<
 export type GoalCompletionCommand = Extract<
   GoalCommand,
   { readonly type: "complete" }
+>;
+
+export type GoalBlockedCommand = Extract<
+  GoalCommand,
+  { readonly type: "block" }
 >;
 
 export class GoalAlreadyExists extends Schema.TaggedError<GoalAlreadyExists>()(
@@ -170,6 +188,11 @@ export class GoalInvalidCompletion extends Schema.TaggedError<GoalInvalidComplet
   { message: Schema.String },
 ) {}
 
+export class GoalInvalidBlockage extends Schema.TaggedError<GoalInvalidBlockage>()(
+  "GoalInvalidBlockage",
+  { message: Schema.String },
+) {}
+
 export class GoalPersistenceError extends Schema.TaggedError<GoalPersistenceError>()(
   "GoalPersistenceError",
   { message: Schema.String },
@@ -191,6 +214,7 @@ export type GoalError =
   | GoalInvalidHistoryQuery
   | GoalInvalidObjective
   | GoalInvalidCompletion
+  | GoalInvalidBlockage
   | GoalPersistenceError
   | GoalGatewayError;
 
@@ -204,6 +228,7 @@ export type GoalErrorCode =
   | "invalid_arguments"
   | "invalid_objective"
   | "invalid_completion"
+  | "invalid_blockage"
   | "persistence_error"
   | "gateway_error";
 
@@ -257,6 +282,8 @@ export function goalErrorToDto(error: GoalError): GoalErrorDto {
       return { code: "invalid_objective", message: error.message };
     case "GoalInvalidCompletion":
       return { code: "invalid_completion", message: error.message };
+    case "GoalInvalidBlockage":
+      return { code: "invalid_blockage", message: error.message };
     case "GoalPersistenceError":
       return { code: "persistence_error", message: error.message };
     case "GoalGatewayError":

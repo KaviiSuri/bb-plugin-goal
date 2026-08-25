@@ -3,6 +3,7 @@ import { Context, DateTime, Effect, Layer } from "effect";
 import {
   GOAL_HISTORY_MAX_LIMIT,
   GoalGatewayError,
+  GoalInvalidBlockage,
   GoalInvalidCompletion,
   GoalInvalidCursor,
   GoalInvalidHistoryQuery,
@@ -18,6 +19,12 @@ import { GoalRepository } from "./repository";
 
 export interface GoalThreadGatewayAdapter {
   readonly threadExists: (threadId: string) => Promise<boolean>;
+}
+
+function isRecoverableBlocker(externalAction: string): boolean {
+  return /^(?:continue(?: working| debugging)?|debug|investigate|keep trying|try again|none|no blocker|unknown|uncertain)$/i.test(
+    externalAction,
+  );
 }
 
 interface GoalThreadGatewayService {
@@ -103,6 +110,10 @@ export class GoalCoordinator extends Context.Service<
       const gateway = yield* GoalThreadGateway;
       const ids = yield* GoalIdGenerator;
       const clock = yield* GoalClock;
+      const blockageObservations = new Map<
+        string,
+        { readonly externalAction: string; readonly repeatedTurns: number }
+      >();
 
       const execute = Effect.fn("GoalCoordinator.execute")(
         function* (command: GoalCommand) {
@@ -190,6 +201,52 @@ export class GoalCoordinator extends Context.Service<
                 now,
               }),
             };
+          }
+
+          if (command.type === "block") {
+            const externalAction = command.externalAction.trim();
+            const evidence = command.evidence.trim();
+            if (
+              externalAction.length === 0 ||
+              evidence.length === 0 ||
+              isRecoverableBlocker(externalAction)
+            ) {
+              return yield* new GoalInvalidBlockage({
+                message:
+                  "Goal Blockage requires an external action and concrete evidence.",
+              });
+            }
+            const observationKey = `${command.goalId}:${command.expectedRevision}`;
+            const previous = blockageObservations.get(observationKey);
+            if (
+              previous !== undefined &&
+              previous.externalAction !== externalAction
+            ) {
+              return yield* new GoalInvalidBlockage({
+                message:
+                  "Goal Blockage requires the same external blocker across the reported turns.",
+              });
+            }
+            if (
+              !Number.isInteger(command.repeatedTurns) ||
+              command.repeatedTurns < 3
+            ) {
+              blockageObservations.set(observationKey, {
+                externalAction,
+                repeatedTurns: command.repeatedTurns,
+              });
+              return yield* new GoalInvalidBlockage({
+                message:
+                  "Goal Blockage requires at least three consecutive turns with the same blocker.",
+              });
+            }
+            const now = yield* clock.nowIso;
+            const result = yield* repository.mutate({
+              command: { ...command, externalAction, evidence },
+              now,
+            });
+            blockageObservations.delete(observationKey);
+            return { goal: result };
           }
 
           const guardedCommand =

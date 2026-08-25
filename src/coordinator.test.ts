@@ -279,6 +279,128 @@ describe("Goal coordinator", () => {
     }
   });
 
+  it("reports a durable external Blockage only with three repeated turns", async () => {
+    const fixture = makeFixture();
+    try {
+      await fixture.runtime.run({
+        type: "start",
+        threadId: "thr_one",
+        objective: "wait for the external dependency",
+      });
+
+      const recoverable = await fixture.runtime.run({
+        type: "block",
+        threadId: "thr_one",
+        goalId: "goal_1",
+        expectedRevision: 1,
+        externalAction: "Keep trying",
+        evidence: "The next attempt may still succeed.",
+        repeatedTurns: 3,
+      });
+      expect(recoverable).toMatchObject({
+        ok: false,
+        error: { code: "invalid_blockage" },
+      });
+
+      const insufficient = await fixture.runtime.run({
+        type: "block",
+        threadId: "thr_one",
+        goalId: "goal_1",
+        expectedRevision: 1,
+        externalAction: "  User must provide the credential  ",
+        evidence: "  The provider rejected every request.  ",
+        repeatedTurns: 2,
+      });
+      expect(insufficient).toEqual({
+        ok: false,
+        error: {
+          code: "invalid_blockage",
+          message:
+            "Goal Blockage requires at least three consecutive turns with the same blocker.",
+        },
+      });
+      await expect(
+        fixture.runtime.run({ type: "status", threadId: "thr_one" }),
+      ).resolves.toMatchObject({
+        ok: true,
+        goal: { state: "active", revision: 1 },
+      });
+
+      const changed = await fixture.runtime.run({
+        type: "block",
+        threadId: "thr_one",
+        goalId: "goal_1",
+        expectedRevision: 1,
+        externalAction: "User must grant filesystem access",
+        evidence: "The same operation now fails for a different reason.",
+        repeatedTurns: 3,
+      });
+      expect(changed).toEqual({
+        ok: false,
+        error: {
+          code: "invalid_blockage",
+          message:
+            "Goal Blockage requires the same external blocker across the reported turns.",
+        },
+      });
+
+      const missingEvidence = await fixture.runtime.run({
+        type: "block",
+        threadId: "thr_one",
+        goalId: "goal_1",
+        expectedRevision: 1,
+        externalAction: "User must provide the credential",
+        evidence: "   ",
+        repeatedTurns: 3,
+      });
+      expect(missingEvidence).toMatchObject({
+        ok: false,
+        error: { code: "invalid_blockage" },
+      });
+
+      const blocked = await fixture.runtime.run({
+        type: "block",
+        threadId: "thr_one",
+        goalId: "goal_1",
+        expectedRevision: 1,
+        externalAction: "  User must provide the credential  ",
+        evidence: "  Provider rejected every request with credential_missing.  ",
+        repeatedTurns: 3,
+      });
+      expect(blocked).toMatchObject({
+        ok: true,
+        goal: {
+          id: "goal_1",
+          state: "blocked",
+          revision: 2,
+          finishedAt: "2026-08-22T12:00:00.000Z",
+          blockageExternalAction: "User must provide the credential",
+          blockageEvidence: "Provider rejected every request with credential_missing.",
+          blockageRepeatedTurns: 3,
+        },
+      });
+      await expect(
+        fixture.runtime.run({ type: "status", threadId: "thr_one" }),
+      ).resolves.toEqual({ ok: true, goal: null });
+
+      const stale = await fixture.runtime.run({
+        type: "block",
+        threadId: "thr_one",
+        goalId: "goal_1",
+        expectedRevision: 1,
+        externalAction: "User must provide the credential",
+        evidence: "old evidence",
+        repeatedTurns: 3,
+      });
+      expect(stale).toMatchObject({
+        ok: false,
+        error: { code: "stale_goal" },
+      });
+    } finally {
+      await fixture.close();
+    }
+  });
+
   it("guards pause, resume, and terminal cancellation transitions", async () => {
     const fixture = makeFixture();
     try {

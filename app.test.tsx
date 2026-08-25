@@ -21,6 +21,9 @@ const activeGoal = {
   finishedAt: null,
   completionSummary: null,
   verificationEvidence: null,
+  blockageExternalAction: null,
+  blockageEvidence: null,
+  blockageRepeatedTurns: null,
 };
 
 type RpcHandlers = PluginRpcTestHandlers<typeof rpcContract>;
@@ -383,6 +386,32 @@ describe("Goal composer row", () => {
       expect(await slot.findByText("Completed Goal")).toBeTruthy();
       expect(slot.getByText(completed.completionSummary!)).toBeTruthy();
       expect(slot.getByText(completed.verificationEvidence!)).toBeTruthy();
+    } finally {
+      slot.lifecycle.unmount();
+    }
+  });
+
+  it("shows external action and evidence for a blocked Goal", async () => {
+    const blocked: Goal = {
+      ...activeGoal,
+      state: "blocked",
+      revision: 2,
+      finishedAt: "2026-08-22T12:05:00.000Z",
+      blockageExternalAction: "User must provide a credential",
+      blockageEvidence: "The provider rejected all three attempts.",
+      blockageRepeatedTurns: 3,
+    };
+    const slot = renderSlot<
+      { threadId: string; params: JsonValue | null },
+      typeof rpcContract
+    >(historyPanel(), { threadId: "thr_ui", params: null }, {
+      rpc: handlers(blocked),
+    });
+    try {
+      expect(await slot.findByText("Blocked Goal")).toBeTruthy();
+      expect(slot.getByText("User must provide a credential")).toBeTruthy();
+      expect(slot.getByText("The provider rejected all three attempts.")).toBeTruthy();
+      expect(slot.getByText(/Same blocker reported for 3 Goal turns/)).toBeTruthy();
     } finally {
       slot.lifecycle.unmount();
     }
