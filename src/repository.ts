@@ -72,6 +72,23 @@ export const GOAL_MIGRATIONS = [
     repeated_turns INTEGER NOT NULL CHECK (repeated_turns >= 1),
     updated_at TEXT NOT NULL
   )`,
+  `CREATE TABLE IF NOT EXISTS goal_continuations (
+    id TEXT PRIMARY KEY,
+    thread_id TEXT NOT NULL,
+    goal_id TEXT NOT NULL,
+    goal_revision INTEGER NOT NULL CHECK (goal_revision >= 1),
+    opportunity_key TEXT NOT NULL,
+    attempt INTEGER NOT NULL CHECK (attempt >= 0),
+    state TEXT NOT NULL CHECK (state IN ('pending', 'claimed', 'sending', 'resolved')),
+    outcome TEXT CHECK (outcome IS NULL OR outcome IN ('sent', 'released', 'expired')),
+    lease_expires_at TEXT,
+    outcome_reason TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(thread_id, opportunity_key)
+  );
+  CREATE INDEX IF NOT EXISTS goal_continuations_pending
+    ON goal_continuations(state, lease_expires_at, created_at)`,
 ] as const;
 
 export function migrateGoalDatabase(database: BetterSqlite3.Database): void {
@@ -119,6 +136,55 @@ type GoalMutationError =
 
 type GoalDeleteError = GoalNotFound | GoalStaleGuard | GoalPersistenceError;
 
+export type GoalContinuationState =
+  | "pending"
+  | "claimed"
+  | "sending"
+  | "resolved";
+export type GoalContinuationOutcome = "sent" | "released" | "expired";
+
+export interface GoalContinuationRecord {
+  readonly id: string;
+  readonly threadId: string;
+  readonly goalId: string;
+  readonly goalRevision: number;
+  readonly opportunityKey: string;
+  readonly attempt: number;
+  readonly state: GoalContinuationState;
+  readonly outcome: GoalContinuationOutcome | null;
+  readonly leaseExpiresAt: string | null;
+  readonly outcomeReason: string | null;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export interface EnqueueGoalContinuationRecord {
+  readonly id: string;
+  readonly threadId: string;
+  readonly goalId: string;
+  readonly goalRevision: number;
+  readonly opportunityKey: string;
+  readonly now: string;
+}
+
+export interface ClaimGoalContinuationRecord {
+  readonly now: string;
+  readonly leaseExpiresAt: string;
+}
+
+export interface MarkGoalContinuationSendingRecord {
+  readonly id: string;
+  readonly now: string;
+  readonly leaseExpiresAt: string;
+}
+
+export interface ResolveGoalContinuationRecord {
+  readonly id: string;
+  readonly now: string;
+  readonly outcome: GoalContinuationOutcome;
+  readonly reason: string;
+}
+
 interface GoalRepositoryService {
   readonly start: (
     record: StartGoalRecord,
@@ -138,6 +204,21 @@ interface GoalRepositoryService {
   readonly delete: (
     record: DeleteGoalRecord,
   ) => Effect.Effect<GoalDto, GoalDeleteError>;
+  readonly enqueueContinuation: (
+    record: EnqueueGoalContinuationRecord,
+  ) => Effect.Effect<GoalContinuationRecord | null, GoalPersistenceError>;
+  readonly recoverContinuations: (
+    now: string,
+  ) => Effect.Effect<void, GoalPersistenceError>;
+  readonly claimContinuation: (
+    record: ClaimGoalContinuationRecord,
+  ) => Effect.Effect<GoalContinuationRecord | null, GoalPersistenceError>;
+  readonly markContinuationSending: (
+    record: MarkGoalContinuationSendingRecord,
+  ) => Effect.Effect<boolean, GoalPersistenceError>;
+  readonly resolveContinuation: (
+    record: ResolveGoalContinuationRecord,
+  ) => Effect.Effect<boolean, GoalPersistenceError>;
 }
 
 export class GoalRepository extends Context.Service<
@@ -170,6 +251,25 @@ type GoalBlockageQualificationRow = {
   readonly blockerKey: string;
   readonly repeatedTurns: number;
 };
+
+type GoalContinuationRow = {
+  readonly id: string;
+  readonly threadId: string;
+  readonly goalId: string;
+  readonly goalRevision: number;
+  readonly opportunityKey: string;
+  readonly attempt: number;
+  readonly state: GoalContinuationState;
+  readonly outcome: GoalContinuationOutcome | null;
+  readonly leaseExpiresAt: string | null;
+  readonly outcomeReason: string | null;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+};
+
+function decodeContinuation(row: GoalContinuationRow): GoalContinuationRecord {
+  return row;
+}
 
 function messageFromCause(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
@@ -385,6 +485,73 @@ export function makeGoalRepositoryLayer(
       const deleteHistoryOrder = database.prepare(
         `DELETE FROM goal_history_order WHERE goal_id = ?`,
       );
+      const continuationColumns = `SELECT
+          id,
+          thread_id AS threadId,
+          goal_id AS goalId,
+          goal_revision AS goalRevision,
+          opportunity_key AS opportunityKey,
+          attempt,
+          state,
+          outcome,
+          lease_expires_at AS leaseExpiresAt,
+          outcome_reason AS outcomeReason,
+          created_at AS createdAt,
+          updated_at AS updatedAt
+        FROM goal_continuations`;
+      const insertContinuation = database.prepare(`
+        INSERT INTO goal_continuations (
+          id, thread_id, goal_id, goal_revision, opportunity_key,
+          attempt, state, outcome, lease_expires_at, outcome_reason,
+          created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, 0, 'pending', NULL, NULL, NULL, ?, ?)
+        ON CONFLICT DO NOTHING
+      `);
+      const selectContinuationById = database.prepare<[string], GoalContinuationRow>(
+        `${continuationColumns} WHERE id = ?`,
+      );
+      const selectPendingContinuation = database.prepare<[], GoalContinuationRow>(
+        `${continuationColumns}
+          WHERE state = 'pending'
+          ORDER BY created_at, id
+          LIMIT 1`,
+      );
+      const expireClaimedContinuations = database.prepare<[string, string]>(`
+        UPDATE goal_continuations
+        SET state = 'pending', outcome = 'expired', lease_expires_at = NULL,
+            outcome_reason = 'claim lease expired', updated_at = ?
+        WHERE state = 'claimed' AND lease_expires_at IS NOT NULL
+          AND lease_expires_at <= ?
+      `);
+      const recoverSendingContinuations = database.prepare<[string]>(`
+        UPDATE goal_continuations
+        SET state = 'resolved', outcome = 'sent', lease_expires_at = NULL,
+            outcome_reason = 'send outcome recovered after restart', updated_at = ?
+        WHERE state = 'sending'
+      `);
+      const recoverClaimedContinuations = database.prepare<[string]>(`
+        UPDATE goal_continuations
+        SET state = 'pending', outcome = 'expired', lease_expires_at = NULL,
+            outcome_reason = 'claim recovered after restart', updated_at = ?
+        WHERE state = 'claimed'
+      `);
+      const claimContinuation = database.prepare<[string, string, string]>(`
+        UPDATE goal_continuations
+        SET state = 'claimed', attempt = attempt + 1,
+            lease_expires_at = ?, updated_at = ?
+        WHERE id = ? AND state = 'pending'
+      `);
+      const markContinuationSending = database.prepare<[string, string, string]>(`
+        UPDATE goal_continuations
+        SET state = 'sending', lease_expires_at = ?, updated_at = ?
+        WHERE id = ? AND state = 'claimed'
+      `);
+      const resolveContinuation = database.prepare<[string, string, string, string]>(`
+        UPDATE goal_continuations
+        SET state = 'resolved', outcome = ?, lease_expires_at = NULL,
+            outcome_reason = ?, updated_at = ?
+        WHERE id = ? AND state IN ('claimed', 'sending')
+      `);
 
       const readCurrent = (threadId: string): GoalDto | null => {
         const row = selectCurrent.get(threadId);
@@ -736,6 +903,116 @@ export function makeGoalRepositoryLayer(
           }),
       );
 
+      const enqueueContinuation = Effect.fn("GoalRepository.enqueueContinuation")(
+        (record: EnqueueGoalContinuationRecord) =>
+          Effect.try({
+            try: () => {
+              const insertResult = insertContinuation.run(
+                record.id,
+                record.threadId,
+                record.goalId,
+                record.goalRevision,
+                record.opportunityKey,
+                record.now,
+                record.now,
+              );
+              const row = selectContinuationById.get(record.id);
+              if (row !== undefined) return decodeContinuation(row);
+              if (insertResult.changes === 0) {
+                const existing = database
+                  .prepare<[string, string], GoalContinuationRow>(
+                    `${continuationColumns}
+                      WHERE thread_id = ? AND opportunity_key = ?`,
+                  )
+                  .get(record.threadId, record.opportunityKey);
+                return existing === undefined ? null : decodeContinuation(existing);
+              }
+              throw new Error("Continuation insert completed without a readable record.");
+            },
+            catch: (cause) =>
+              new GoalPersistenceError({
+                message: `Could not persist Continuation claim: ${messageFromCause(cause)}`,
+              }),
+          }),
+      );
+
+      const recoverContinuations = Effect.fn("GoalRepository.recoverContinuations")(
+        (now: string) =>
+          Effect.try({
+            try: () => {
+              const recover = database.transaction(() => {
+                recoverSendingContinuations.run(now);
+                recoverClaimedContinuations.run(now);
+              });
+              recover();
+            },
+            catch: (cause) =>
+              new GoalPersistenceError({
+                message: `Could not recover Continuations: ${messageFromCause(cause)}`,
+              }),
+          }),
+      );
+
+      const claimNextContinuation = Effect.fn("GoalRepository.claimContinuation")(
+        (record: ClaimGoalContinuationRecord) =>
+          Effect.try({
+            try: () => {
+              const transaction = database.transaction(() => {
+                expireClaimedContinuations.run(record.now, record.now);
+                const pending = selectPendingContinuation.get();
+                if (pending === undefined) return null;
+                const result = claimContinuation.run(
+                  record.leaseExpiresAt,
+                  record.now,
+                  pending.id,
+                );
+                if (result.changes !== 1) return null;
+                const claimed = selectContinuationById.get(pending.id);
+                return claimed === undefined ? null : decodeContinuation(claimed);
+              });
+              return transaction();
+            },
+            catch: (cause) =>
+              new GoalPersistenceError({
+                message: `Could not claim Continuation: ${messageFromCause(cause)}`,
+              }),
+          }),
+      );
+
+      const markContinuationSendingClaim = Effect.fn(
+        "GoalRepository.markContinuationSending",
+      )((record: MarkGoalContinuationSendingRecord) =>
+        Effect.try({
+          try: () =>
+            markContinuationSending.run(
+              record.leaseExpiresAt,
+              record.now,
+              record.id,
+            ).changes === 1,
+          catch: (cause) =>
+            new GoalPersistenceError({
+              message: `Could not mark Continuation as sending: ${messageFromCause(cause)}`,
+            }),
+        }),
+      );
+
+      const resolveContinuationClaim = Effect.fn("GoalRepository.resolveContinuation")(
+        (record: ResolveGoalContinuationRecord) =>
+          Effect.try({
+            try: () =>
+              resolveContinuation.run(
+                record.outcome,
+                record.reason,
+                record.now,
+                record.id,
+              ).changes === 1,
+            catch: (cause) =>
+              new GoalPersistenceError({
+                message: `Could not resolve Continuation: ${messageFromCause(cause)}`,
+              }),
+          }),
+      );
+
       return GoalRepository.of({
         current,
         history,
@@ -743,6 +1020,11 @@ export function makeGoalRepositoryLayer(
         start,
         mutate,
         delete: deleteGoal,
+        enqueueContinuation,
+        recoverContinuations,
+        claimContinuation: claimNextContinuation,
+        markContinuationSending: markContinuationSendingClaim,
+        resolveContinuation: resolveContinuationClaim,
       });
     }),
   );

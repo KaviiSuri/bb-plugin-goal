@@ -127,6 +127,57 @@ describe("Goal BB adapter", () => {
     }
   });
 
+  it("continues an idle active Goal once despite duplicate idle events", async () => {
+    let sends = 0;
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "goal",
+      sdk: {
+        threads: {
+          get: async ({ threadId }) =>
+            makeThreadResponse({
+              id: threadId,
+              status: "idle",
+              updatedAt: 42,
+              environmentId: "env_test",
+            }),
+          send: async () => {
+            sends += 1;
+            return { ok: true };
+          },
+        },
+      },
+    });
+    await deterministicPlugin()(bb);
+    const service = harness.behavior.runService("continuations");
+    const idle = {
+      thread: makeThreadResponse({
+        id: "thr_auto",
+        status: "idle",
+        updatedAt: 42,
+        environmentId: "env_test",
+      }),
+      lastAssistantText: null,
+    };
+    try {
+      await harness.behavior.callRpc("start", {
+        threadId: "thr_auto",
+        objective: "automatically continue this Goal",
+      });
+      await harness.behavior.emitThreadEvent("thread.idle", idle);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      await harness.behavior.emitThreadEvent("thread.idle", idle);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(sends).toBe(1);
+      expect(
+        harness.inspection.sdk.callsTo("threads.send"),
+      ).toHaveLength(1);
+    } finally {
+      service.controller.abort();
+      await service.done;
+      await harness.lifecycle.dispose();
+    }
+  });
+
   it("contributes the same bounded active Goal context to every provider without running Effect", async () => {
     let runtimeRuns = 0;
     const observedPlugin = createPlugin({
@@ -140,6 +191,9 @@ describe("Goal BB adapter", () => {
             runtimeRuns += 1;
             return runtime.run(command);
           },
+          enqueueIdle: runtime.enqueueIdle,
+          recoverContinuations: runtime.recoverContinuations,
+          processContinuation: runtime.processContinuation,
           dispose: runtime.dispose,
         };
       },
@@ -1165,6 +1219,9 @@ describe("Goal BB adapter", () => {
         const runtime = makeGoalRuntime(database, gateway);
         return {
           run: runtime.run,
+          enqueueIdle: runtime.enqueueIdle,
+          recoverContinuations: runtime.recoverContinuations,
+          processContinuation: runtime.processContinuation,
           async dispose() {
             expect(database.open).toBe(true);
             disposalCount += 1;

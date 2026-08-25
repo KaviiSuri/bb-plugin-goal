@@ -12,6 +12,7 @@ interface Fixture {
   readonly database: Database.Database;
   readonly directory: string;
   readonly runtime: GoalRuntime;
+  readonly continuationSends: () => number;
   readonly close: () => Promise<void>;
 }
 
@@ -20,10 +21,15 @@ function makeFixture(existingThreads: readonly string[] = ["thr_one"]): Fixture 
   const database = new Database(join(directory, "goal.db"));
   migrateGoalDatabase(database);
   let id = 0;
+  let continuationSends = 0;
   const runtime = makeGoalRuntime(
     database,
     {
       threadExists: async (threadId) => existingThreads.includes(threadId),
+      readThread: async () => ({ status: "idle" }),
+      sendContinuation: async () => {
+        continuationSends += 1;
+      },
     },
     {
       nextGoalId: () => `goal_${++id}`,
@@ -34,6 +40,7 @@ function makeFixture(existingThreads: readonly string[] = ["thr_one"]): Fixture 
     database,
     directory,
     runtime,
+    continuationSends: () => continuationSends,
     async close() {
       await runtime.dispose();
       if (database.open) database.close();
@@ -1012,6 +1019,193 @@ describe("Goal coordinator", () => {
       expect(fixture.database.prepare("SELECT 1 AS value").get()).toEqual({
         value: 1,
       });
+    } finally {
+      if (fixture.database.open) fixture.database.close();
+      rmSync(fixture.directory, { recursive: true, force: true });
+    }
+  });
+
+  it("claims one idle opportunity and survives continuation crashes and reloads", async () => {
+    const fixture = makeFixture();
+    try {
+      await fixture.runtime.run({
+        type: "start",
+        threadId: "thr_one",
+        objective: "continue safely",
+      });
+
+      await fixture.runtime.enqueueIdle("thr_one", "idle-before-claim");
+      const [first, duplicate] = await Promise.all([
+        fixture.runtime.processContinuation(new AbortController().signal),
+        fixture.runtime.processContinuation(new AbortController().signal),
+      ]);
+      expect(first || duplicate).toBe(true);
+      expect(fixture.continuationSends()).toBe(1);
+      expect(
+        fixture.database
+          .prepare(
+            "SELECT state, outcome, attempt FROM goal_continuations WHERE opportunity_key = ?",
+          )
+          .get("idle-before-claim"),
+      ).toEqual({ state: "resolved", outcome: "sent", attempt: 1 });
+
+      await fixture.runtime.enqueueIdle("thr_one", "idle-before-claim");
+      expect(
+        await fixture.runtime.processContinuation(new AbortController().signal),
+      ).toBe(false);
+      expect(fixture.continuationSends()).toBe(1);
+
+      await fixture.runtime.enqueueIdle("thr_one", "idle-after-claim");
+      fixture.database
+        .prepare(
+          "UPDATE goal_continuations SET state = 'claimed', lease_expires_at = ? WHERE opportunity_key = ?",
+        )
+        .run("2026-08-22T12:01:00.000Z", "idle-after-claim");
+      await fixture.runtime.dispose();
+      let reloaded = makeGoalRuntime(
+        fixture.database,
+        {
+          threadExists: async () => true,
+          readThread: async () => ({ status: "idle" }),
+          sendContinuation: async () => {
+            // The fixture's original adapter owns the observable count.
+          },
+        },
+        {
+          nextGoalId: () => "unused_after_claim",
+          nowIso: () => "2026-08-22T12:00:00.000Z",
+        },
+      );
+      try {
+        await reloaded.recoverContinuations();
+        expect(
+          await reloaded.processContinuation(new AbortController().signal),
+        ).toBe(true);
+        expect(
+          fixture.database
+            .prepare(
+              "SELECT state, outcome, attempt FROM goal_continuations WHERE opportunity_key = ?",
+            )
+            .get("idle-after-claim"),
+        ).toMatchObject({ state: "resolved", outcome: "sent", attempt: 1 });
+      } finally {
+        await reloaded.dispose();
+      }
+
+      await fixture.runtime.dispose();
+      reloaded = makeGoalRuntime(
+        fixture.database,
+        {
+          threadExists: async () => true,
+          readThread: async () => ({ status: "idle" }),
+          sendContinuation: async () => {
+            // An ambiguous send is resolved without replay after restart.
+          },
+        },
+        {
+          nextGoalId: () => "unused_after_send",
+          nowIso: () => "2026-08-22T12:00:00.000Z",
+        },
+      );
+      await reloaded.enqueueIdle("thr_one", "idle-after-send");
+      fixture.database
+        .prepare(
+          "UPDATE goal_continuations SET state = 'sending' WHERE opportunity_key = ?",
+        )
+        .run("idle-after-send");
+      await reloaded.recoverContinuations();
+      expect(
+        await reloaded.processContinuation(new AbortController().signal),
+      ).toBe(false);
+      expect(
+        fixture.database
+          .prepare(
+            "SELECT state, outcome FROM goal_continuations WHERE opportunity_key = ?",
+          )
+          .get("idle-after-send"),
+      ).toEqual({ state: "resolved", outcome: "sent" });
+      await reloaded.dispose();
+
+      const stale = makeGoalRuntime(
+        fixture.database,
+        {
+          threadExists: async () => true,
+          readThread: async () => ({ status: "idle" }),
+          sendContinuation: async () => {
+            throw new Error("must not send stale Goal");
+          },
+        },
+        {
+          nextGoalId: () => "unused_stale",
+          nowIso: () => "2026-08-22T12:00:00.000Z",
+        },
+      );
+      try {
+        await stale.enqueueIdle("thr_one", "idle-stale");
+        await stale.run({
+          type: "edit",
+          threadId: "thr_one",
+          goalId: "goal_1",
+          expectedRevision: 1,
+          objective: "edited after idle claim",
+        });
+        expect(
+          await stale.processContinuation(new AbortController().signal),
+        ).toBe(true);
+        expect(
+          fixture.database
+            .prepare(
+              "SELECT state, outcome FROM goal_continuations WHERE opportunity_key = ?",
+            )
+            .get("idle-stale"),
+        ).toEqual({ state: "resolved", outcome: "released" });
+      } finally {
+        await stale.dispose();
+      }
+    } finally {
+      if (fixture.database.open) fixture.database.close();
+      rmSync(fixture.directory, { recursive: true, force: true });
+    }
+  });
+
+  it("recovers a pending Continuation after a restart before its claim", async () => {
+    const fixture = makeFixture();
+    try {
+      await fixture.runtime.run({
+        type: "start",
+        threadId: "thr_one",
+        objective: "recover the pending opportunity",
+      });
+      await fixture.runtime.enqueueIdle("thr_one", "idle-pending-restart");
+      await fixture.runtime.dispose();
+
+      const reloaded = makeGoalRuntime(
+        fixture.database,
+        {
+          threadExists: async () => true,
+          readThread: async () => ({ status: "idle" }),
+          sendContinuation: async () => {},
+        },
+        {
+          nextGoalId: () => "unused_pending",
+          nowIso: () => "2026-08-22T12:00:00.000Z",
+        },
+      );
+      try {
+        await reloaded.recoverContinuations();
+        expect(
+          await reloaded.processContinuation(new AbortController().signal),
+        ).toBe(true);
+        expect(
+          fixture.database
+            .prepare(
+              "SELECT state, outcome, attempt FROM goal_continuations WHERE opportunity_key = ?",
+            )
+            .get("idle-pending-restart"),
+        ).toEqual({ state: "resolved", outcome: "sent", attempt: 1 });
+      } finally {
+        await reloaded.dispose();
+      }
     } finally {
       if (fixture.database.open) fixture.database.close();
       rmSync(fixture.directory, { recursive: true, force: true });

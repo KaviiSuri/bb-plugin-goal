@@ -20,7 +20,11 @@ import {
   GOAL_MIGRATIONS,
   makeCurrentGoalSnapshotReader,
 } from "./src/repository";
-import { makeGoalRuntime, type GoalRuntime } from "./src/runtime";
+import {
+  makeGoalRuntime,
+  type GoalRuntime,
+} from "./src/runtime";
+import type { GoalThreadGatewayAdapter } from "./src/coordinator";
 
 export const GOAL_REALTIME_CHANNEL = "goal.changed";
 
@@ -124,7 +128,7 @@ export const rpcContract = defineRpcContract({
 interface PluginDependencies {
   readonly makeRuntime: (
     database: BetterSqlite3.Database,
-    gateway: { readonly threadExists: (threadId: string) => Promise<boolean> },
+    gateway: GoalThreadGatewayAdapter,
   ) => GoalRuntime;
 }
 
@@ -772,6 +776,66 @@ export function createPlugin(
           return false;
         }
       },
+      async readThread(threadId, signal) {
+        const thread = await bb.sdk.threads.get({ threadId, signal });
+        return { status: thread.status };
+      },
+      async sendContinuation(threadId, signal) {
+        if (signal?.aborted === true) {
+          throw new Error("Goal plugin is shutting down.");
+        }
+        await bb.sdk.threads.send({
+          threadId,
+          mode: "auto",
+          input: [
+            {
+              type: "text",
+              text:
+                "Continue working toward the active BB Goal. Re-read the objective and make the next meaningful step. Do not stop unless the Goal is complete or genuinely blocked.",
+              mentions: [],
+            },
+          ],
+        });
+      },
+    });
+
+    let disposed = false;
+    let wakeWorker: (() => void) | null = null;
+    const wake = () => {
+      const resolve = wakeWorker;
+      wakeWorker = null;
+      resolve?.();
+    };
+    const waitForWork = (signal: AbortSignal): Promise<void> => {
+      if (signal.aborted) return Promise.resolve();
+      return new Promise((resolve) => {
+        const finish = () => {
+          signal.removeEventListener("abort", finish);
+          if (wakeWorker === finish) wakeWorker = null;
+          resolve();
+        };
+        wakeWorker = finish;
+        signal.addEventListener("abort", finish, { once: true });
+      });
+    };
+
+    bb.events.on("thread.idle", async ({ thread }) => {
+      if (disposed) return;
+      await runtime.enqueueIdle(thread.id, `idle:${thread.updatedAt}`);
+      wake();
+    });
+
+    bb.background.service("continuations", {
+      async start(signal) {
+        await runtime.recoverContinuations();
+        while (!signal.aborted) {
+          let claimed = false;
+          do {
+            claimed = await runtime.processContinuation(signal);
+          } while (claimed && !signal.aborted);
+          if (!signal.aborted) await waitForWork(signal);
+        }
+      },
     });
     const snapshots = makeCurrentGoalSnapshotReader(database);
 
@@ -995,7 +1059,11 @@ export function createPlugin(
       run: (argv, ctx) => runCli(bb, runtime, argv, ctx),
     });
 
-    bb.onDispose(() => runtime.dispose());
+    bb.onDispose(() => {
+      disposed = true;
+      wake();
+      return runtime.dispose();
+    });
     bb.log.info("Goal coordinator loaded");
   };
 }

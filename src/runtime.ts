@@ -2,6 +2,7 @@ import type BetterSqlite3 from "better-sqlite3";
 import { Effect, Layer, ManagedRuntime, Result } from "effect";
 import {
   GoalClock,
+  GoalContinuationCoordinator,
   GoalCoordinator,
   GoalIdGenerator,
   liveGoalClockLayer,
@@ -18,6 +19,12 @@ import { makeGoalRepositoryLayer } from "./repository";
 
 export interface GoalRuntime {
   readonly run: (command: GoalCommand) => Promise<GoalCommandResult>;
+  readonly enqueueIdle: (
+    threadId: string,
+    opportunityKey: string,
+  ) => Promise<void>;
+  readonly recoverContinuations: () => Promise<void>;
+  readonly processContinuation: (signal: AbortSignal) => Promise<boolean>;
   readonly dispose: () => Promise<void>;
 }
 
@@ -56,9 +63,10 @@ export function makeGoalRuntime(
     idLayer,
     clockLayer,
   );
-  const coordinatorLayer = GoalCoordinator.layer.pipe(
-    Layer.provide(dependencies),
-  );
+  const coordinatorLayer = Layer.mergeAll(
+    GoalCoordinator.layer,
+    GoalContinuationCoordinator.layer,
+  ).pipe(Layer.provide(dependencies));
   const runtime = ManagedRuntime.make(coordinatorLayer);
   let disposed = false;
 
@@ -72,6 +80,26 @@ export function makeGoalRuntime(
       return Result.isFailure(result)
         ? { ok: false, error: goalErrorToDto(result.failure) }
         : { ok: true, ...result.success };
+    },
+    async enqueueIdle(threadId, opportunityKey) {
+      await runtime.runPromise(
+        GoalContinuationCoordinator.use((coordinator) =>
+          coordinator.enqueueIdle({ threadId, opportunityKey }),
+        ),
+      );
+    },
+    async recoverContinuations() {
+      await runtime.runPromise(
+        GoalContinuationCoordinator.use((coordinator) => coordinator.recover()),
+      );
+    },
+    async processContinuation(signal) {
+      const result = await runtime.runPromise(
+        GoalContinuationCoordinator.use((coordinator) =>
+          coordinator.process(signal),
+        ),
+      );
+      return result.kind !== "idle";
     },
     async dispose() {
       if (disposed) return;

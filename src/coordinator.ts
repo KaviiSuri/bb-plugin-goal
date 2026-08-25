@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { Context, DateTime, Effect, Layer } from "effect";
+import { Context, DateTime, Duration, Effect, Layer } from "effect";
 import {
   GOAL_HISTORY_MAX_LIMIT,
   GoalGatewayError,
@@ -15,10 +15,25 @@ import {
   type GoalHistoryPage,
 } from "./domain";
 import { decodeGoalHistoryCursor } from "./history-cursor";
-import { GoalRepository } from "./repository";
+import {
+  GoalRepository,
+  type GoalContinuationRecord,
+} from "./repository";
+
+export interface GoalThreadSnapshot {
+  readonly status: string;
+}
 
 export interface GoalThreadGatewayAdapter {
   readonly threadExists: (threadId: string) => Promise<boolean>;
+  readonly readThread?: (
+    threadId: string,
+    signal?: AbortSignal,
+  ) => Promise<GoalThreadSnapshot>;
+  readonly sendContinuation?: (
+    threadId: string,
+    signal?: AbortSignal,
+  ) => Promise<void>;
 }
 
 function isRecoverableBlocker(externalAction: string): boolean {
@@ -31,6 +46,14 @@ interface GoalThreadGatewayService {
   readonly requireThread: (
     threadId: string,
   ) => Effect.Effect<void, GoalThreadNotFound | GoalGatewayError>;
+  readonly readThread: (
+    threadId: string,
+    signal?: AbortSignal,
+  ) => Effect.Effect<GoalThreadSnapshot, GoalGatewayError>;
+  readonly sendContinuation: (
+    threadId: string,
+    signal?: AbortSignal,
+  ) => Effect.Effect<void, GoalGatewayError>;
 }
 
 export class GoalThreadGateway extends Context.Service<
@@ -54,6 +77,38 @@ export function makeGoalThreadGatewayLayer(
               }),
           });
           if (!exists) return yield* new GoalThreadNotFound({ threadId });
+        },
+      ),
+      readThread: Effect.fn("GoalThreadGateway.readThread")(
+        function* (threadId: string, signal?: AbortSignal) {
+          if (adapter.readThread === undefined) {
+            return yield* new GoalGatewayError({
+              message: "The BB thread gateway cannot read thread state.",
+            });
+          }
+          return yield* Effect.tryPromise({
+            try: () => adapter.readThread!(threadId, signal),
+            catch: (cause) =>
+              new GoalGatewayError({
+                message: `Could not read thread ${threadId}: ${cause instanceof Error ? cause.message : String(cause)}`,
+              }),
+          });
+        },
+      ),
+      sendContinuation: Effect.fn("GoalThreadGateway.sendContinuation")(
+        function* (threadId: string, signal?: AbortSignal) {
+          if (adapter.sendContinuation === undefined) {
+            return yield* new GoalGatewayError({
+              message: "The BB thread gateway cannot send a Continuation.",
+            });
+          }
+          return yield* Effect.tryPromise({
+            try: () => adapter.sendContinuation!(threadId, signal),
+            catch: (cause) =>
+              new GoalGatewayError({
+                message: `Could not send a Continuation for thread ${threadId}: ${cause instanceof Error ? cause.message : String(cause)}`,
+              }),
+          });
         },
       ),
     }),
@@ -92,6 +147,18 @@ export const liveGoalClockLayer = Layer.succeed(
 export type GoalCoordinatorResult =
   | { readonly goal: GoalDto | null }
   | { readonly page: GoalHistoryPage };
+
+export const GOAL_CONTINUATION_LEASE_SECONDS = 30;
+
+export interface GoalContinuationRequest {
+  readonly threadId: string;
+  readonly opportunityKey: string;
+}
+
+export type GoalContinuationProcessResult =
+  | { readonly kind: "idle" }
+  | { readonly kind: "sent"; readonly continuation: GoalContinuationRecord }
+  | { readonly kind: "released"; readonly continuation: GoalContinuationRecord };
 
 interface GoalCoordinatorService {
   readonly execute: (
@@ -247,6 +314,130 @@ export class GoalCoordinator extends Context.Service<
       );
 
       return GoalCoordinator.of({ execute });
+    }),
+  );
+}
+
+interface GoalContinuationCoordinatorService {
+  readonly enqueueIdle: (
+    request: GoalContinuationRequest,
+  ) => Effect.Effect<GoalContinuationRecord | null, GoalError>;
+  readonly recover: () => Effect.Effect<void, GoalError>;
+  readonly process: (
+    signal?: AbortSignal,
+  ) => Effect.Effect<GoalContinuationProcessResult, GoalError>;
+}
+
+export class GoalContinuationCoordinator extends Context.Service<
+  GoalContinuationCoordinator,
+  GoalContinuationCoordinatorService
+>()("bb-plugin-goal/GoalContinuationCoordinator") {
+  static readonly layer = Layer.effect(
+    GoalContinuationCoordinator,
+    Effect.gen(function* () {
+      const repository = yield* GoalRepository;
+      const gateway = yield* GoalThreadGateway;
+      const ids = yield* GoalIdGenerator;
+      const clock = yield* GoalClock;
+
+      const nowAndLease = Effect.gen(function* () {
+        const now = yield* clock.nowIso;
+        const leaseExpiresAt = DateTime.formatIso(
+          DateTime.addDuration(
+            DateTime.makeUnsafe(now),
+            Duration.seconds(GOAL_CONTINUATION_LEASE_SECONDS),
+          ),
+        );
+        return { now, leaseExpiresAt };
+      });
+
+      const enqueueIdle = Effect.fn("GoalContinuationCoordinator.enqueueIdle")(
+        function* (request: GoalContinuationRequest) {
+          const current = yield* repository.current(request.threadId);
+          if (current === null || current.state !== "active") return null;
+          const now = yield* clock.nowIso;
+          return yield* repository.enqueueContinuation({
+            id: yield* ids.next,
+            threadId: request.threadId,
+            goalId: current.id,
+            goalRevision: current.revision,
+            opportunityKey: request.opportunityKey,
+            now,
+          });
+        },
+      );
+
+      const recover = Effect.fn("GoalContinuationCoordinator.recover")(
+        function* () {
+          yield* repository.recoverContinuations(yield* clock.nowIso);
+        },
+      );
+
+      const process = Effect.fn("GoalContinuationCoordinator.process")(
+        function* (signal?: AbortSignal) {
+          const lease = yield* nowAndLease;
+          const continuation = yield* repository.claimContinuation(lease);
+          if (continuation === null) return { kind: "idle" as const };
+
+          const current = yield* repository.current(continuation.threadId);
+          const thread = yield* gateway.readThread(
+            continuation.threadId,
+            signal,
+          );
+          if (
+            signal?.aborted === true ||
+            current === null ||
+            current.id !== continuation.goalId ||
+            current.revision !== continuation.goalRevision ||
+            current.state !== "active" ||
+            thread.status !== "idle"
+          ) {
+            yield* repository.resolveContinuation({
+              id: continuation.id,
+              now: lease.now,
+              outcome: "released",
+              reason:
+                signal?.aborted === true
+                  ? "plugin cancellation"
+                  : "Goal or thread was no longer eligible",
+            });
+            return { kind: "released" as const, continuation };
+          }
+
+          const markedSending = yield* repository.markContinuationSending({
+            id: continuation.id,
+            now: lease.now,
+            leaseExpiresAt: lease.leaseExpiresAt,
+          });
+          if (!markedSending) return { kind: "released" as const, continuation };
+
+          try {
+            yield* gateway.sendContinuation(continuation.threadId, signal);
+          } catch (cause) {
+            yield* repository.resolveContinuation({
+              id: continuation.id,
+              now: lease.now,
+              outcome: "released",
+              reason: cause instanceof Error ? cause.message : String(cause),
+            });
+            return { kind: "released" as const, continuation };
+          }
+
+          yield* repository.resolveContinuation({
+            id: continuation.id,
+            now: lease.now,
+            outcome: "sent",
+            reason: "Continuation sent",
+          });
+          return { kind: "sent" as const, continuation };
+        },
+      );
+
+      return GoalContinuationCoordinator.of({
+        enqueueIdle,
+        recover,
+        process,
+      });
     }),
   );
 }
