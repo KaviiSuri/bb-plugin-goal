@@ -262,6 +262,86 @@ describe("Goal BB adapter", () => {
     }
   });
 
+  it("retries failed idle enqueues independently for threads sharing updatedAt", async () => {
+    const failedThreads = new Set<string>();
+    const sentThreads: string[] = [];
+    let goalId = 0;
+    const observedPlugin = createPlugin({
+      makeRuntime(database, gateway): GoalRuntime {
+        const runtime = makeGoalRuntime(database, gateway, {
+          nextGoalId: () => `goal_${++goalId}`,
+          nowIso: () => "2026-08-22T12:00:00.000Z",
+        });
+        return {
+          ...runtime,
+          async enqueueIdle(threadId, opportunityKey) {
+            if (!failedThreads.has(threadId)) {
+              failedThreads.add(threadId);
+              throw new Error(`initial enqueue failure for ${threadId}`);
+            }
+            await runtime.enqueueIdle(threadId, opportunityKey);
+          },
+        };
+      },
+    });
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "goal",
+      sdk: {
+        threads: {
+          get: async ({ threadId }) =>
+            makeThreadResponse({
+              id: threadId,
+              status: "idle",
+              updatedAt: 42,
+              environmentId: "env_test",
+            }),
+          send: async ({ threadId }) => {
+            sentThreads.push(threadId);
+            return { ok: true };
+          },
+        },
+      },
+    });
+    await observedPlugin(bb);
+    try {
+      await harness.behavior.callRpc("start", {
+        threadId: "thr_one",
+        objective: "continue Goal one",
+      });
+      await harness.behavior.callRpc("start", {
+        threadId: "thr_two",
+        objective: "continue Goal two",
+      });
+      for (const threadId of ["thr_one", "thr_two"]) {
+        const result = await harness.behavior.emitThreadEvent("thread.idle", {
+          thread: makeThreadResponse({
+            id: threadId,
+            status: "idle",
+            updatedAt: 42,
+            environmentId: "env_test",
+          }),
+          lastAssistantText: null,
+        });
+        expect(result.errors).toEqual([]);
+      }
+      expect(failedThreads).toEqual(new Set(["thr_one", "thr_two"]));
+
+      const service = harness.behavior.runService("continuations");
+      try {
+        await waitUntil(() => sentThreads.length === 2);
+        expect(sentThreads.sort()).toEqual(["thr_one", "thr_two"]);
+        expect(
+          harness.inspection.sdk.callsTo("threads.send"),
+        ).toHaveLength(2);
+      } finally {
+        service.controller.abort();
+        await service.done;
+      }
+    } finally {
+      await harness.lifecycle.dispose();
+    }
+  });
+
   it("retries transient startup recovery without a new idle event", async () => {
     let recoveryAttempts = 0;
     const observedPlugin = createPlugin({

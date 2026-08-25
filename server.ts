@@ -820,6 +820,8 @@ export function createPlugin(
       string,
       { readonly threadId: string; readonly opportunityKey: string }
     >();
+    const pendingIdleEventKey = (threadId: string, opportunityKey: string) =>
+      `${threadId}\u0000${opportunityKey}`;
     const wake = () => {
       const resolve = wakeWorker;
       wakeWorker = null;
@@ -845,23 +847,24 @@ export function createPlugin(
     };
 
     const retryPendingIdleEvents = async (signal: AbortSignal) => {
-      for (const [opportunityKey, event] of pendingIdleEvents) {
+      for (const [pendingKey, event] of pendingIdleEvents) {
         if (signal.aborted) return;
-        await runtime.enqueueIdle(event.threadId, opportunityKey);
-        pendingIdleEvents.delete(opportunityKey);
+        await runtime.enqueueIdle(event.threadId, event.opportunityKey);
+        pendingIdleEvents.delete(pendingKey);
       }
     };
 
     bb.events.on("thread.idle", async ({ thread }) => {
       if (disposed) return;
       const opportunityKey = `idle:${thread.updatedAt}`;
+      const pendingKey = pendingIdleEventKey(thread.id, opportunityKey);
       try {
         await runtime.enqueueIdle(thread.id, opportunityKey);
-        pendingIdleEvents.delete(opportunityKey);
+        pendingIdleEvents.delete(pendingKey);
         wake();
       } catch (cause) {
         if (disposed) return;
-        pendingIdleEvents.set(opportunityKey, {
+        pendingIdleEvents.set(pendingKey, {
           threadId: thread.id,
           opportunityKey,
         });
