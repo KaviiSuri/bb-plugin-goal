@@ -21,6 +21,7 @@ import {
   type GoalContinuationRecord,
   type RecoverGoalUsageLimitRecord,
 } from "./repository";
+import type { GoalSettledContinuationObservation } from "./progress";
 
 export type GoalThreadStatus =
   | "active"
@@ -131,6 +132,11 @@ export interface GoalThreadGatewayAdapter {
     deliveryMarker: string,
     signal?: AbortSignal,
   ) => Promise<boolean>;
+  readonly observeContinuation?: (
+    threadId: string,
+    deliveryMarker: string,
+    signal?: AbortSignal,
+  ) => Promise<GoalSettledContinuationObservation | null>;
 }
 
 export function goalContinuationMarker(continuationId: string): string {
@@ -161,6 +167,11 @@ interface GoalThreadGatewayService {
     deliveryMarker: string,
     signal?: AbortSignal,
   ) => Effect.Effect<boolean, GoalGatewayError>;
+  readonly observeContinuation: (
+    threadId: string,
+    deliveryMarker: string,
+    signal?: AbortSignal,
+  ) => Effect.Effect<GoalSettledContinuationObservation | null, GoalGatewayError>;
 }
 
 export class GoalThreadGateway extends Context.Service<
@@ -238,6 +249,23 @@ export function makeGoalThreadGatewayLayer(
             catch: (cause) =>
               new GoalGatewayError({
                 message: `Could not reconcile Continuation for thread ${threadId}: ${cause instanceof Error ? cause.message : String(cause)}`,
+              }),
+          });
+        },
+      ),
+      observeContinuation: Effect.fn("GoalThreadGateway.observeContinuation")(
+        function* (
+          threadId: string,
+          deliveryMarker: string,
+          signal?: AbortSignal,
+        ) {
+          if (adapter.observeContinuation === undefined) return null;
+          return yield* Effect.tryPromise({
+            try: () =>
+              adapter.observeContinuation!(threadId, deliveryMarker, signal),
+            catch: (cause) =>
+              new GoalGatewayError({
+                message: `Could not observe Continuation for thread ${threadId}: ${cause instanceof Error ? cause.message : String(cause)}`,
               }),
           });
         },
@@ -466,6 +494,9 @@ interface GoalContinuationCoordinatorService {
     request: GoalContinuationRequest,
   ) => Effect.Effect<GoalContinuationRecord | null, GoalError>;
   readonly recover: () => Effect.Effect<void, GoalError>;
+  readonly assessSettled: (
+    signal?: AbortSignal,
+  ) => Effect.Effect<readonly GoalDto[], GoalError>;
   readonly recoverUsageLimits: () => Effect.Effect<readonly GoalDto[], GoalError>;
   readonly nextUsageLimitReset: () => Effect.Effect<string | null, GoalError>;
   readonly process: (
@@ -570,6 +601,37 @@ export class GoalContinuationCoordinator extends Context.Service<
       const nextUsageLimitReset = Effect.fn(
         "GoalContinuationCoordinator.nextUsageLimitReset",
       )(() => repository.nextUsageLimitReset());
+
+      const assessSettled = Effect.fn(
+        "GoalContinuationCoordinator.assessSettled",
+      )(function* (signal?: AbortSignal) {
+        const continuations = yield* repository.unassessedSentContinuations();
+        const changed: GoalDto[] = [];
+        for (const continuation of continuations) {
+          if (signal?.aborted === true) break;
+          const deliveryMarker =
+            continuation.deliveryMarker ??
+            goalContinuationMarker(continuation.id);
+          const observation = yield* gateway.observeContinuation(
+            continuation.threadId,
+            deliveryMarker,
+            signal,
+          );
+          if (observation === null) continue;
+          const goal = yield* repository.assessContinuation({
+            continuationId: continuation.id,
+            goalId: continuation.goalId,
+            goalRevision: continuation.goalRevision,
+            threadId: continuation.threadId,
+            observation,
+            now: yield* clock.nowIso,
+          });
+          if (goal?.noProgressLastContinuationId === continuation.id) {
+            changed.push(goal);
+          }
+        }
+        return changed;
+      });
 
       const process = Effect.fn("GoalContinuationCoordinator.process")(
         function* (signal?: AbortSignal) {
@@ -700,6 +762,7 @@ export class GoalContinuationCoordinator extends Context.Service<
       return GoalContinuationCoordinator.of({
         enqueueIdle,
         recover,
+        assessSettled,
         recoverUsageLimits,
         nextUsageLimitReset,
         process,

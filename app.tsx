@@ -42,7 +42,12 @@ interface GoalView {
   readonly blockageExternalAction: string | null;
   readonly blockageEvidence: string | null;
   readonly blockageRepeatedTurns: number | null;
-  readonly pauseReasonCode: "manual" | "failure" | "usage-limit" | null;
+  readonly pauseReasonCode:
+    | "manual"
+    | "failure"
+    | "usage-limit"
+    | "no-progress"
+    | null;
   readonly pauseReason: string | null;
   readonly usageLimitKind:
     | "subscription-window"
@@ -51,6 +56,15 @@ interface GoalView {
     | "unknown"
     | null;
   readonly usageResetAt: string | null;
+  readonly noProgressConsecutiveCount: number;
+  readonly noProgressLastContinuationId: string | null;
+  readonly noProgressAssistantResultFingerprint: string | null;
+  readonly noProgressEvidence: {
+    readonly turnId: string;
+    readonly terminalSeq: number;
+    readonly signals: readonly string[];
+    readonly assessment: "progress" | "no-progress";
+  } | null;
 }
 
 type ViewState =
@@ -262,6 +276,15 @@ export function GoalHistoryPanel({ threadId }: { readonly threadId: string }) {
                             {goal.usageResetAt === null
                               ? " (manual resume required)"
                               : ` · resets ${goal.usageResetAt}`}
+                          </p>
+                        ) : null}
+                        {goal.noProgressEvidence !== null ? (
+                          <p className="mt-1 text-xs text-muted-foreground">
+                            No-progress count: {goal.noProgressConsecutiveCount}
+                            {` · turn ${goal.noProgressEvidence.turnId} · terminal sequence ${goal.noProgressEvidence.terminalSeq}`}
+                            {goal.noProgressEvidence.signals.length === 0
+                              ? " · no qualifying signals"
+                              : ` · signals ${goal.noProgressEvidence.signals.join(", ")}`}
                           </p>
                         ) : null}
                       </div>
@@ -623,6 +646,11 @@ export function GoalComposerRow() {
             {view.goal.objective}
             {view.goal.pauseReason === null ? "" : ` · ${view.goal.pauseReason}`}
           </span>
+          {view.goal.noProgressConsecutiveCount > 0 ? (
+            <span className="shrink-0 text-xs text-muted-foreground">
+              No-progress {view.goal.noProgressConsecutiveCount}/3
+            </span>
+          ) : null}
           <div className="flex shrink-0 items-center gap-1">
             <Button
               size="sm"

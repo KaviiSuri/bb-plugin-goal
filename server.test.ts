@@ -4,7 +4,7 @@ import {
   createFakePluginHost,
   makeThreadResponse,
 } from "@get-bb/plugin-sdk/testing";
-import plugin, { createPlugin } from "./server";
+import plugin, { createPlugin, GOAL_REALTIME_CHANNEL } from "./server";
 import type { GoalDto } from "./src/domain";
 import { GOAL_MIGRATIONS } from "./src/repository";
 import { makeGoalRuntime, type GoalRuntime } from "./src/runtime";
@@ -856,6 +856,7 @@ describe("Goal BB adapter", () => {
             return { ok: true };
           },
           timeline: async () => ({ rows: timelineRows, activePromptMode: null }),
+          events: { list: async () => [], wait: async () => null },
           queuedMessages: { list: async () => [] },
           interactions: { list: async () => [] },
         },
@@ -976,6 +977,182 @@ describe("Goal BB adapter", () => {
     }
   });
 
+  it("uses fake-host structured events to pause before a fourth no-progress send", async () => {
+    const eventRows: any[] = [];
+    const sentMarkers: string[] = [];
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "goal",
+      sdk: {
+        threads: {
+          get: async ({ threadId }) =>
+            makeThreadResponse({
+              id: threadId,
+              status: "idle",
+              updatedAt: 1,
+              environmentId: "env_test",
+            }),
+          send: async ({ input }) => {
+            const text = input.find((part) => part.type === "text");
+            const marker =
+              text?.type === "text"
+                ? text.text.match(/bb-goal-continuation:[^ ]+/)?.[0]
+                : undefined;
+            if (marker !== undefined) sentMarkers.push(marker);
+            return { ok: true };
+          },
+          timeline: async () => ({ rows: [], activePromptMode: null }),
+          queuedMessages: { list: async () => [] },
+          interactions: { list: async () => [] },
+          events: {
+            list: async (args) => {
+              const limit = Number(args.limit ?? "500");
+              const filtered = eventRows
+                .filter((row) =>
+                  args.types === undefined || args.types.includes(row.type),
+                )
+                .filter((row) =>
+                  args.afterSeq === undefined
+                    ? true
+                    : row.seq > Number(args.afterSeq),
+                )
+                .filter((row) =>
+                  args.beforeSeq === undefined
+                    ? true
+                    : row.seq < Number(args.beforeSeq),
+                )
+                .sort((left, right) =>
+                  args.order === "desc"
+                    ? right.seq - left.seq
+                    : left.seq - right.seq,
+                );
+              return filtered.slice(0, limit);
+            },
+            wait: async () => null,
+          },
+        },
+      },
+    });
+    const addSettledTurn = (attempt: number, marker: string) => {
+      const base = attempt * 10;
+      const turnId = `turn_${attempt}`;
+      eventRows.push(
+        {
+          id: `request_${attempt}`,
+          seq: base,
+          createdAt: base,
+          scope: { kind: "thread" },
+          type: "client/turn/requested",
+          data: {
+            initiator: "system",
+            requestId: `client_${attempt}`,
+            target: { kind: "auto", expectedTurnId: null },
+            input: [{ type: "text", text: `Internal delivery marker: ${marker}` }],
+          },
+        },
+        {
+          id: `accepted_${attempt}`,
+          seq: base + 1,
+          createdAt: base + 1,
+          scope: { kind: "turn", turnId },
+          type: "turn/input/accepted",
+          data: { clientRequestId: `client_${attempt}` },
+        },
+        {
+          id: `assistant_${attempt}`,
+          seq: base + 2,
+          createdAt: base + 2,
+          scope: { kind: "turn", turnId },
+          type: "item/completed",
+          data: {
+            item: {
+              id: `message_${attempt}`,
+              type: "agentMessage",
+              text: "unchanged result",
+            },
+          },
+        },
+        {
+          id: `terminal_${attempt}`,
+          seq: base + 3,
+          createdAt: base + 3,
+          scope: { kind: "turn", turnId },
+          type: "turn/completed",
+          data: { status: "completed" },
+        },
+      );
+    };
+
+    await deterministicPlugin()(bb);
+    const service = harness.behavior.runService("continuations");
+    try {
+      await harness.behavior.callRpc("start", {
+        threadId: "thr_no_progress",
+        objective: "stop before the uncontrolled send",
+      });
+      for (let attempt = 1; attempt <= 4; attempt += 1) {
+        await harness.behavior.emitThreadEvent("thread.idle", {
+          thread: makeThreadResponse({
+            id: "thr_no_progress",
+            status: "idle",
+            updatedAt: attempt,
+            environmentId: "env_test",
+          }),
+          lastAssistantText: "must not be parsed",
+        });
+        await waitUntil(() => sentMarkers.length === attempt);
+        addSettledTurn(attempt, sentMarkers.at(-1)!);
+      }
+      await harness.behavior.emitThreadEvent("thread.idle", {
+        thread: makeThreadResponse({
+          id: "thr_no_progress",
+          status: "idle",
+          updatedAt: 5,
+          environmentId: "env_test",
+        }),
+        lastAssistantText: "still must not be parsed",
+      });
+      await waitUntil(
+        () =>
+          (
+            bb.storage
+              .database()
+              .prepare("SELECT state FROM goals WHERE thread_id = ?")
+              .get("thr_no_progress") as { state: string }
+          ).state === "paused",
+      );
+      expect(sentMarkers).toHaveLength(4);
+      const shown = await harness.behavior.runCli(["status", "--json"], {
+        threadId: "thr_no_progress",
+      });
+      expect(JSON.parse(shown.stdout)).toMatchObject({
+        goal: {
+          state: "paused",
+          pauseReasonCode: "no-progress",
+          noProgressConsecutiveCount: 3,
+          noProgressEvidence: {
+            assessment: "no-progress",
+            turnId: "turn_4",
+            terminalSeq: 43,
+            signals: [],
+          },
+        },
+      });
+      expect(harness.inspection.realtimeSignals.at(-1)).toMatchObject({
+        channel: GOAL_REALTIME_CHANNEL,
+        payload: {
+          state: "paused",
+          pauseReasonCode: "no-progress",
+          noProgressConsecutiveCount: 3,
+          noProgressEvidence: { turnId: "turn_4", terminalSeq: 43 },
+        },
+      });
+    } finally {
+      service.controller.abort();
+      await service.done;
+      await harness.lifecycle.dispose();
+    }
+  });
+
   it("contributes the same bounded active Goal context to every provider without running Effect", async () => {
     let runtimeRuns = 0;
     const observedPlugin = createPlugin({
@@ -992,6 +1169,7 @@ describe("Goal BB adapter", () => {
           enqueueIdle: runtime.enqueueIdle,
           recordFailure: runtime.recordFailure,
           recoverContinuations: runtime.recoverContinuations,
+          assessSettledContinuations: runtime.assessSettledContinuations,
           recoverUsageLimits: runtime.recoverUsageLimits,
           nextUsageLimitReset: runtime.nextUsageLimitReset,
           processContinuation: runtime.processContinuation,
@@ -2023,6 +2201,7 @@ describe("Goal BB adapter", () => {
           enqueueIdle: runtime.enqueueIdle,
           recordFailure: runtime.recordFailure,
           recoverContinuations: runtime.recoverContinuations,
+          assessSettledContinuations: runtime.assessSettledContinuations,
           recoverUsageLimits: runtime.recoverUsageLimits,
           nextUsageLimitReset: runtime.nextUsageLimitReset,
           processContinuation: runtime.processContinuation,

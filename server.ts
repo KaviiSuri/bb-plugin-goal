@@ -30,6 +30,11 @@ import {
   type ClassifiedGoalFailure,
 } from "./src/failure";
 import type { GoalFailureEventIdentity } from "./src/domain";
+import {
+  continuationPrompt,
+  observeSettledContinuation,
+  type GoalStructuredEventRow,
+} from "./src/progress";
 
 export const GOAL_REALTIME_CHANNEL = "goal.changed";
 
@@ -48,12 +53,44 @@ const goalSchema = z
     blockageExternalAction: z.string().nullable(),
     blockageEvidence: z.string().nullable(),
     blockageRepeatedTurns: z.number().int().nullable(),
-    pauseReasonCode: z.enum(["manual", "failure", "usage-limit"]).nullable(),
+    pauseReasonCode: z
+      .enum(["manual", "failure", "usage-limit", "no-progress"])
+      .nullable(),
     pauseReason: z.string().nullable(),
     usageLimitKind: z
       .enum(["subscription-window", "credits", "spend-control", "unknown"])
       .nullable(),
     usageResetAt: z.string().nullable(),
+    noProgressConsecutiveCount: z.number().int().min(0),
+    noProgressLastContinuationId: z.string().nullable(),
+    noProgressAssistantResultFingerprint: z.string().nullable(),
+    noProgressEvidence: z
+      .object({
+        continuationId: z.string(),
+        requestEventId: z.string(),
+        requestSeq: z.number().int(),
+        requestId: z.string(),
+        acceptedEventId: z.string(),
+        acceptedSeq: z.number().int(),
+        turnId: z.string(),
+        terminalEventId: z.string(),
+        terminalSeq: z.number().int(),
+        signals: z.array(
+          z.enum([
+            "tool-call",
+            "file-mutation",
+            "external-action",
+            "pending-interaction",
+            "changed-assistant-result",
+          ]),
+        ),
+        assistantResultFingerprint: z.string().nullable(),
+        previousAssistantResultFingerprint: z.string().nullable(),
+        assessment: z.enum(["progress", "no-progress"]),
+        observedAt: z.string(),
+      })
+      .strict()
+      .nullable(),
   })
   .strict();
 
@@ -201,6 +238,15 @@ function formatGoal(goal: GoalDto, heading: string): string {
         ? ["Manual resume required: yes"]
         : []
       : [`Usage reset at: ${goal.usageResetAt}`]),
+    `Consecutive no-progress Continuations: ${goal.noProgressConsecutiveCount}`,
+    ...(goal.noProgressLastContinuationId === null
+      ? []
+      : [`Last assessed Continuation: ${goal.noProgressLastContinuationId}`]),
+    ...(goal.noProgressEvidence === null
+      ? []
+      : [
+          `No-progress evidence: ${goal.noProgressEvidence.assessment}; turn ${goal.noProgressEvidence.turnId}; terminal sequence ${goal.noProgressEvidence.terminalSeq}; signals ${goal.noProgressEvidence.signals.join(", ") || "none"}`,
+        ]),
   ].join("\n");
 }
 
@@ -536,6 +582,9 @@ function publishGoalChanged(
     goalId: goal.id,
     revision: goal.revision,
     state: goal.state,
+    pauseReasonCode: goal.pauseReasonCode,
+    noProgressConsecutiveCount: goal.noProgressConsecutiveCount,
+    noProgressEvidence: goal.noProgressEvidence,
     deleted,
   });
 }
@@ -805,6 +854,52 @@ function objectData(data: unknown): Record<string, unknown> | null {
     : null;
 }
 
+const progressEventTypes = [
+  "client/turn/requested",
+  "turn/input/accepted",
+  "turn/completed",
+  "item/started",
+  "item/completed",
+  "turn/diff/updated",
+  "system/permissionGrant/lifecycle",
+  "system/userQuestion/lifecycle",
+] as const;
+
+async function observeThreadContinuation(
+  bb: BbPluginApi,
+  threadId: string,
+  deliveryMarker: string,
+  signal?: AbortSignal,
+) {
+  const rows: GoalStructuredEventRow[] = [];
+  let beforeSeq: string | undefined;
+  while (true) {
+    const page = await bb.sdk.threads.events.list({
+      threadId,
+      ...(beforeSeq === undefined ? {} : { beforeSeq }),
+      order: "desc",
+      limit: "500",
+      types: progressEventTypes,
+      signal,
+    });
+    rows.push(
+      ...page.map((row) => ({
+        id: row.id,
+        seq: row.seq,
+        createdAt: row.createdAt,
+        scope: row.scope,
+        type: row.type,
+        data: row.data,
+      })),
+    );
+    const observation = observeSettledContinuation(rows, deliveryMarker);
+    if (observation !== null || page.length < 500) return observation;
+    const oldest = page.at(-1);
+    if (oldest === undefined) return null;
+    beforeSeq = String(oldest.seq);
+  }
+}
+
 async function classifyThreadFailure(
   bb: BbPluginApi,
   threadId: string,
@@ -1020,9 +1115,7 @@ export function createPlugin(
           input: [
             {
               type: "text",
-              text:
-                "Continue working toward the active BB Goal. Re-read the objective and make the next meaningful step. Do not stop unless the Goal is complete or genuinely blocked. " +
-                `Internal delivery marker: ${deliveryMarker}`,
+              text: continuationPrompt(deliveryMarker),
               mentions: [],
               visibility: "agent-only",
             },
@@ -1038,6 +1131,14 @@ export function createPlugin(
         });
         return timeline.rows.some(
           (row) => "text" in row && row.text.includes(deliveryMarker),
+        );
+      },
+      observeContinuation(threadId, deliveryMarker, signal) {
+        return observeThreadContinuation(
+          bb,
+          threadId,
+          deliveryMarker,
+          signal,
         );
       },
     });
@@ -1079,6 +1180,8 @@ export function createPlugin(
     const retryPendingIdleEvents = async (signal: AbortSignal) => {
       for (const [pendingKey, event] of pendingIdleEvents) {
         if (signal.aborted) return;
+        const assessed = await runtime.assessSettledContinuations(signal);
+        for (const goal of assessed) publishGoalChanged(bb, goal);
         await runtime.enqueueIdle(event.threadId, event.opportunityKey);
         pendingIdleEvents.delete(pendingKey);
       }
@@ -1089,6 +1192,8 @@ export function createPlugin(
       const opportunityKey = `idle:${thread.updatedAt}`;
       const pendingKey = pendingIdleEventKey(thread.id, opportunityKey);
       try {
+        const assessed = await runtime.assessSettledContinuations();
+        for (const goal of assessed) publishGoalChanged(bb, goal);
         await runtime.enqueueIdle(thread.id, opportunityKey);
         pendingIdleEvents.delete(pendingKey);
         wake();
@@ -1149,6 +1254,8 @@ export function createPlugin(
               );
             }
             await runtime.recoverContinuations();
+            const assessed = await runtime.assessSettledContinuations(signal);
+            for (const goal of assessed) publishGoalChanged(bb, goal);
             let claimed = false;
             do {
               claimed = await runtime.processContinuation(signal);

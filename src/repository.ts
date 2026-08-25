@@ -17,6 +17,8 @@ import {
   type GoalGuardedAction,
   type GoalHistoryPage,
   type GoalMutationCommand,
+  type GoalNoProgressEvidence,
+  type GoalProgressSignalKind,
 } from "./domain";
 import {
   encodeGoalHistoryCursor,
@@ -107,6 +109,14 @@ export const GOAL_MIGRATIONS = [
   CREATE INDEX IF NOT EXISTS goal_failure_events_by_sequence
     ON goal_failure_events(thread_id, event_seq DESC)`,
   `ALTER TABLE goal_failure_events ADD COLUMN turn_id TEXT`,
+  `ALTER TABLE goals ADD COLUMN no_progress_consecutive_count INTEGER NOT NULL DEFAULT 0;
+   ALTER TABLE goals ADD COLUMN no_progress_last_continuation_id TEXT;
+   ALTER TABLE goals ADD COLUMN no_progress_assistant_result_fingerprint TEXT;
+   ALTER TABLE goals ADD COLUMN no_progress_evidence_json TEXT;
+   ALTER TABLE goal_continuations ADD COLUMN progress_assessed_at TEXT;
+   ALTER TABLE goal_continuations ADD COLUMN progress_evidence_json TEXT;
+   CREATE INDEX IF NOT EXISTS goal_continuations_unassessed_sent
+     ON goal_continuations(outcome, progress_assessed_at, created_at)`,
 ] as const;
 
 export function migrateGoalDatabase(database: BetterSqlite3.Database): void {
@@ -190,6 +200,7 @@ export interface GoalContinuationRecord {
   readonly outcomeReason: string | null;
   readonly createdAt: string;
   readonly updatedAt: string;
+  readonly progressAssessedAt: string | null;
 }
 
 export interface EnqueueGoalContinuationRecord {
@@ -226,6 +237,27 @@ export interface ResolveGoalContinuationRecord {
   readonly now: string;
   readonly outcome: GoalContinuationOutcome;
   readonly reason: string;
+}
+
+export interface AssessGoalContinuationRecord {
+  readonly continuationId: string;
+  readonly goalId: string;
+  readonly goalRevision: number;
+  readonly threadId: string;
+  readonly observation: Omit<
+    GoalNoProgressEvidence,
+    | "continuationId"
+    | "signals"
+    | "previousAssistantResultFingerprint"
+    | "assessment"
+    | "observedAt"
+  > & {
+    readonly signals: readonly Exclude<
+      GoalProgressSignalKind,
+      "changed-assistant-result"
+    >[];
+  };
+  readonly now: string;
 }
 
 interface GoalRepositoryService {
@@ -279,6 +311,13 @@ interface GoalRepositoryService {
   readonly resolveContinuation: (
     record: ResolveGoalContinuationRecord,
   ) => Effect.Effect<boolean, GoalPersistenceError>;
+  readonly unassessedSentContinuations: () => Effect.Effect<
+    readonly GoalContinuationRecord[],
+    GoalPersistenceError
+  >;
+  readonly assessContinuation: (
+    record: AssessGoalContinuationRecord,
+  ) => Effect.Effect<GoalDto | null, GoalPersistenceError>;
 }
 
 export class GoalRepository extends Context.Service<
@@ -306,6 +345,10 @@ type GoalRow = {
   readonly pauseReason: string | null;
   readonly usageLimitKind: string | null;
   readonly usageResetAt: string | null;
+  readonly noProgressConsecutiveCount: number;
+  readonly noProgressLastContinuationId: string | null;
+  readonly noProgressAssistantResultFingerprint: string | null;
+  readonly noProgressEvidence: string | null;
 };
 
 type GoalHistoryRow = GoalRow & { readonly historySequence: number };
@@ -330,10 +373,21 @@ type GoalContinuationRow = {
   readonly outcomeReason: string | null;
   readonly createdAt: string;
   readonly updatedAt: string;
+  readonly progressAssessedAt: string | null;
 };
 
 function decodeContinuation(row: GoalContinuationRow): GoalContinuationRecord {
   return row;
+}
+
+function decodeGoalRow(row: GoalRow): GoalDto {
+  return decodeGoal({
+    ...row,
+    noProgressEvidence:
+      row.noProgressEvidence === null
+        ? null
+        : JSON.parse(row.noProgressEvidence),
+  }) as GoalDto;
 }
 
 function messageFromCause(cause: unknown): string {
@@ -399,7 +453,11 @@ const goalColumns = `SELECT
     pause_reason_code AS pauseReasonCode,
     pause_reason AS pauseReason,
     usage_limit_kind AS usageLimitKind,
-    usage_reset_at AS usageResetAt
+    usage_reset_at AS usageResetAt,
+    no_progress_consecutive_count AS noProgressConsecutiveCount,
+    no_progress_last_continuation_id AS noProgressLastContinuationId,
+    no_progress_assistant_result_fingerprint AS noProgressAssistantResultFingerprint,
+    no_progress_evidence_json AS noProgressEvidence
   FROM goals`;
 
 export interface CurrentGoalSnapshotReader {
@@ -416,7 +474,7 @@ export function makeCurrentGoalSnapshotReader(
   return {
     current(threadId) {
       const row = selectCurrent.get(threadId);
-      return row === undefined ? null : (decodeGoal(row) as GoalDto);
+      return row === undefined ? null : decodeGoalRow(row);
     },
   };
 }
@@ -449,6 +507,10 @@ export function makeGoalRepositoryLayer(
           goals.pause_reason AS pauseReason,
           goals.usage_limit_kind AS usageLimitKind,
           goals.usage_reset_at AS usageResetAt,
+          goals.no_progress_consecutive_count AS noProgressConsecutiveCount,
+          goals.no_progress_last_continuation_id AS noProgressLastContinuationId,
+          goals.no_progress_assistant_result_fingerprint AS noProgressAssistantResultFingerprint,
+          goals.no_progress_evidence_json AS noProgressEvidence,
           goal_history_order.sequence AS historySequence
         FROM goals
         INNER JOIN goal_history_order
@@ -495,7 +557,11 @@ export function makeGoalRepositoryLayer(
       );
       const edit = database.prepare(
         `UPDATE goals
-          SET objective = ?, revision = revision + 1, updated_at = ?
+          SET objective = ?, revision = revision + 1, updated_at = ?,
+            no_progress_consecutive_count = 0,
+            no_progress_last_continuation_id = NULL,
+            no_progress_assistant_result_fingerprint = NULL,
+            no_progress_evidence_json = NULL
           WHERE id = ? AND thread_id = ? AND revision = ? AND finished_at IS NULL`,
       );
       const pause = database.prepare(
@@ -510,7 +576,11 @@ export function makeGoalRepositoryLayer(
         `UPDATE goals
           SET state = 'active', revision = revision + 1, updated_at = ?,
             pause_reason_code = NULL, pause_reason = NULL,
-            usage_limit_kind = NULL, usage_reset_at = NULL
+            usage_limit_kind = NULL, usage_reset_at = NULL,
+            no_progress_consecutive_count = 0,
+            no_progress_last_continuation_id = NULL,
+            no_progress_assistant_result_fingerprint = NULL,
+            no_progress_evidence_json = NULL
           WHERE id = ? AND thread_id = ? AND revision = ? AND state IN ('paused', 'waiting') AND finished_at IS NULL`,
       );
       const recordFailure = database.prepare(
@@ -632,7 +702,8 @@ export function makeGoalRepositoryLayer(
           lease_expires_at AS leaseExpiresAt,
           outcome_reason AS outcomeReason,
           created_at AS createdAt,
-          updated_at AS updatedAt
+          updated_at AS updatedAt,
+          progress_assessed_at AS progressAssessedAt
         FROM goal_continuations`;
       const insertContinuation = database.prepare(`
         INSERT INTO goal_continuations (
@@ -662,6 +733,12 @@ export function makeGoalRepositoryLayer(
         ${continuationColumns}
           WHERE state = 'sending'
           ORDER BY updated_at, id
+      `);
+      const selectUnassessedSentContinuations = database.prepare<[], GoalContinuationRow>(`
+        ${continuationColumns}
+          WHERE state = 'resolved' AND outcome = 'sent'
+            AND progress_assessed_at IS NULL
+          ORDER BY created_at, id
       `);
       const recoverClaimedContinuations = database.prepare<[string]>(`
         UPDATE goal_continuations
@@ -693,21 +770,56 @@ export function makeGoalRepositoryLayer(
             outcome_reason = ?, updated_at = ?
         WHERE id = ? AND state IN ('claimed', 'sending')
       `);
+      const markContinuationAssessed = database.prepare<
+        [string, string, string, string]
+      >(`UPDATE goal_continuations
+          SET progress_assessed_at = ?, progress_evidence_json = ?, updated_at = ?
+          WHERE id = ? AND state = 'resolved' AND outcome = 'sent'
+            AND progress_assessed_at IS NULL`);
+      const resetNoProgress = database.prepare(
+        `UPDATE goals
+          SET no_progress_consecutive_count = 0,
+            no_progress_last_continuation_id = ?,
+            no_progress_assistant_result_fingerprint = ?,
+            no_progress_evidence_json = ?, updated_at = ?
+          WHERE id = ? AND thread_id = ? AND revision = ?
+            AND state = 'active' AND finished_at IS NULL`,
+      );
+      const incrementNoProgress = database.prepare(
+        `UPDATE goals
+          SET no_progress_consecutive_count = no_progress_consecutive_count + 1,
+            no_progress_last_continuation_id = ?,
+            no_progress_assistant_result_fingerprint = ?,
+            no_progress_evidence_json = ?, updated_at = ?,
+            state = CASE WHEN no_progress_consecutive_count + 1 >= 3 THEN 'paused' ELSE state END,
+            revision = CASE WHEN no_progress_consecutive_count + 1 >= 3 THEN revision + 1 ELSE revision END,
+            pause_reason_code = CASE WHEN no_progress_consecutive_count + 1 >= 3 THEN 'no-progress' ELSE pause_reason_code END,
+            pause_reason = CASE WHEN no_progress_consecutive_count + 1 >= 3 THEN 'Paused after 3 consecutive automatic Continuations made no observable progress' ELSE pause_reason END
+          WHERE id = ? AND thread_id = ? AND revision = ?
+            AND state = 'active' AND finished_at IS NULL`,
+      );
+      const releasePendingGoalContinuations = database.prepare(
+        `UPDATE goal_continuations
+          SET state = 'resolved', outcome = 'released', lease_expires_at = NULL,
+            outcome_reason = 'Goal paused by no-progress protection', updated_at = ?
+          WHERE goal_id = ? AND goal_revision = ?
+            AND state IN ('pending', 'claimed', 'sending')`,
+      );
 
       const readCurrent = (threadId: string): GoalDto | null => {
         const row = selectCurrent.get(threadId);
-        return row === undefined ? null : (decodeGoal(row) as GoalDto);
+        return row === undefined ? null : decodeGoalRow(row);
       };
       const readByThreadAndId = (
         goalId: string,
         threadId: string,
       ): GoalDto | null => {
         const row = selectByThreadAndId.get(goalId, threadId);
-        return row === undefined ? null : (decodeGoal(row) as GoalDto);
+        return row === undefined ? null : decodeGoalRow(row);
       };
       const readById = (goalId: string): GoalDto | null => {
         const row = selectById.get(goalId);
-        return row === undefined ? null : (decodeGoal(row) as GoalDto);
+        return row === undefined ? null : decodeGoalRow(row);
       };
 
       const startTransaction = database.transaction(
@@ -988,6 +1100,126 @@ export function makeGoalRepositoryLayer(
         },
       );
 
+      const assessContinuationTransaction = database.transaction(
+        (record: AssessGoalContinuationRecord): GoalDto | null => {
+          const continuation = selectContinuationById.get(
+            record.continuationId,
+          );
+          if (
+            continuation === undefined ||
+            continuation.progressAssessedAt !== null ||
+            continuation.outcome !== "sent" ||
+            continuation.goalId !== record.goalId ||
+            continuation.goalRevision !== record.goalRevision ||
+            continuation.threadId !== record.threadId
+          ) {
+            return readCurrent(record.threadId);
+          }
+
+          const current = readCurrent(record.threadId);
+          const currentEvidence = current?.noProgressEvidence ?? null;
+          const ownsCurrentRevision =
+            current !== null &&
+            current.id === record.goalId &&
+            current.revision === record.goalRevision &&
+            current.state === "active";
+          if (
+            !ownsCurrentRevision ||
+            (currentEvidence !== null &&
+              record.observation.terminalSeq <= currentEvidence.terminalSeq)
+          ) {
+            const ignored = JSON.stringify({
+              assessment: "ignored",
+              continuationId: record.continuationId,
+              terminalEventId: record.observation.terminalEventId,
+              terminalSeq: record.observation.terminalSeq,
+              observedAt: record.now,
+              reason: !ownsCurrentRevision
+                ? "Goal identity, revision, or state changed"
+                : "A later Continuation was already assessed",
+            });
+            markContinuationAssessed.run(
+              record.now,
+              ignored,
+              record.now,
+              record.continuationId,
+            );
+            return current;
+          }
+
+          const previousAssistantResultFingerprint =
+            current.noProgressAssistantResultFingerprint;
+          const changedAssistantResult =
+            record.observation.assistantResultFingerprint !== null &&
+            record.observation.assistantResultFingerprint !==
+              previousAssistantResultFingerprint;
+          const signals: GoalProgressSignalKind[] = [
+            ...record.observation.signals,
+            ...(changedAssistantResult
+              ? (["changed-assistant-result"] as const)
+              : []),
+          ];
+          const evidence: GoalNoProgressEvidence = {
+            continuationId: record.continuationId,
+            ...record.observation,
+            signals,
+            previousAssistantResultFingerprint,
+            assessment: signals.length > 0 ? "progress" : "no-progress",
+            observedAt: record.now,
+          };
+          const evidenceJson = JSON.stringify(evidence);
+          const nextAssistantResultFingerprint =
+            record.observation.assistantResultFingerprint ??
+            previousAssistantResultFingerprint;
+          const result =
+            signals.length > 0
+              ? resetNoProgress.run(
+                  record.continuationId,
+                  nextAssistantResultFingerprint,
+                  evidenceJson,
+                  record.now,
+                  record.goalId,
+                  record.threadId,
+                  record.goalRevision,
+                )
+              : incrementNoProgress.run(
+                  record.continuationId,
+                  nextAssistantResultFingerprint,
+                  evidenceJson,
+                  record.now,
+                  record.goalId,
+                  record.threadId,
+                  record.goalRevision,
+                );
+          if (result.changes !== 1) {
+            throw new Error("Goal changed while assessing Continuation progress.");
+          }
+          const updated = readById(record.goalId);
+          if (
+            updated !== null &&
+            updated.pauseReasonCode === "no-progress" &&
+            updated.noProgressConsecutiveCount === 3
+          ) {
+            releasePendingGoalContinuations.run(
+              record.now,
+              record.goalId,
+              record.goalRevision,
+            );
+          }
+          if (
+            markContinuationAssessed.run(
+              record.now,
+              evidenceJson,
+              record.now,
+              record.continuationId,
+            ).changes !== 1
+          ) {
+            throw new Error("Continuation assessment was not recorded.");
+          }
+          return updated;
+        },
+      );
+
       const recoverUsageLimitTransaction = database.transaction(
         (record: RecoverGoalUsageLimitRecord): GoalDto | null => {
           const result = recoverUsageLimit.run(
@@ -1068,7 +1300,7 @@ export function makeGoalRepositoryLayer(
                     );
               const goals = rows
                 .slice(0, record.limit)
-                .map((row) => decodeGoal(row) as GoalDto);
+                .map(decodeGoalRow);
               const lastRow = rows.at(record.limit - 1);
               return {
                 goals,
@@ -1155,7 +1387,7 @@ export function makeGoalRepositoryLayer(
       const dueUsageLimits = Effect.fn("GoalRepository.dueUsageLimits")(
         (now: string) =>
           Effect.try({
-            try: () => selectDueUsageLimits.all(now).map((row) => decodeGoal(row) as GoalDto),
+            try: () => selectDueUsageLimits.all(now).map(decodeGoalRow),
             catch: (cause) =>
               new GoalPersistenceError({
                 message: `Could not read due Goal usage limits: ${messageFromCause(cause)}`,
@@ -1246,6 +1478,31 @@ export function makeGoalRepositoryLayer(
           catch: (cause) =>
             new GoalPersistenceError({
               message: `Could not list sending Continuations: ${messageFromCause(cause)}`,
+            }),
+        }),
+      );
+
+      const unassessedSentContinuations = Effect.fn(
+        "GoalRepository.unassessedSentContinuations",
+      )(() =>
+        Effect.try({
+          try: () =>
+            selectUnassessedSentContinuations.all().map(decodeContinuation),
+          catch: (cause) =>
+            new GoalPersistenceError({
+              message: `Could not list unassessed Continuations: ${messageFromCause(cause)}`,
+            }),
+        }),
+      );
+
+      const assessContinuation = Effect.fn(
+        "GoalRepository.assessContinuation",
+      )((record: AssessGoalContinuationRecord) =>
+        Effect.try({
+          try: () => assessContinuationTransaction(record),
+          catch: (cause) =>
+            new GoalPersistenceError({
+              message: `Could not assess Continuation progress: ${messageFromCause(cause)}`,
             }),
         }),
       );
@@ -1347,6 +1604,8 @@ export function makeGoalRepositoryLayer(
         claimContinuation: claimNextContinuation,
         markContinuationSending: markContinuationSendingClaim,
         resolveContinuation: resolveContinuationClaim,
+        unassessedSentContinuations,
+        assessContinuation,
       });
     }),
   );

@@ -33,6 +33,9 @@ export interface GoalRuntime {
     observedEvents?: readonly GoalFailureEventIdentity[],
   ) => Promise<GoalDto | null>;
   readonly recoverContinuations: () => Promise<void>;
+  readonly assessSettledContinuations: (
+    signal?: AbortSignal,
+  ) => Promise<readonly GoalDto[]>;
   readonly recoverUsageLimits: () => Promise<readonly GoalDto[]>;
   readonly nextUsageLimitReset: () => Promise<string | null>;
   readonly processContinuation: (signal: AbortSignal) => Promise<boolean>;
@@ -116,6 +119,13 @@ export function makeGoalRuntime(
     async recoverContinuations() {
       await runtime.runPromise(
         GoalContinuationCoordinator.use((coordinator) => coordinator.recover()),
+      );
+    },
+    async assessSettledContinuations(signal) {
+      return runtime.runPromise(
+        GoalContinuationCoordinator.use((coordinator) =>
+          coordinator.assessSettled(signal),
+        ),
       );
     },
     async recoverUsageLimits() {

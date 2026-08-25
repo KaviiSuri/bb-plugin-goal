@@ -14,7 +14,12 @@ export type GoalState = (typeof goalStates)[number];
 export const goalMutationTypes = ["edit", "pause", "resume", "cancel"] as const;
 export type GoalMutationType = (typeof goalMutationTypes)[number];
 
-export const goalPauseReasonCodes = ["manual", "failure", "usage-limit"] as const;
+export const goalPauseReasonCodes = [
+  "manual",
+  "failure",
+  "usage-limit",
+  "no-progress",
+] as const;
 export type GoalPauseReasonCode = (typeof goalPauseReasonCodes)[number];
 
 export const goalUsageLimitKinds = [
@@ -24,6 +29,49 @@ export const goalUsageLimitKinds = [
   "unknown",
 ] as const;
 export type GoalUsageLimitKind = (typeof goalUsageLimitKinds)[number];
+
+export const goalProgressSignalKinds = [
+  "tool-call",
+  "file-mutation",
+  "external-action",
+  "pending-interaction",
+  "changed-assistant-result",
+] as const;
+export type GoalProgressSignalKind = (typeof goalProgressSignalKinds)[number];
+
+export interface GoalNoProgressEvidence {
+  readonly continuationId: string;
+  readonly requestEventId: string;
+  readonly requestSeq: number;
+  readonly requestId: string;
+  readonly acceptedEventId: string;
+  readonly acceptedSeq: number;
+  readonly turnId: string;
+  readonly terminalEventId: string;
+  readonly terminalSeq: number;
+  readonly signals: GoalProgressSignalKind[];
+  readonly assistantResultFingerprint: string | null;
+  readonly previousAssistantResultFingerprint: string | null;
+  readonly assessment: "progress" | "no-progress";
+  readonly observedAt: string;
+}
+
+const GoalNoProgressEvidenceSchema = Schema.Struct({
+  continuationId: Schema.String,
+  requestEventId: Schema.String,
+  requestSeq: Schema.Int,
+  requestId: Schema.String,
+  acceptedEventId: Schema.String,
+  acceptedSeq: Schema.Int,
+  turnId: Schema.String,
+  terminalEventId: Schema.String,
+  terminalSeq: Schema.Int,
+  signals: Schema.Array(Schema.Literals(goalProgressSignalKinds)),
+  assistantResultFingerprint: Schema.NullOr(Schema.String),
+  previousAssistantResultFingerprint: Schema.NullOr(Schema.String),
+  assessment: Schema.Literals(["progress", "no-progress"]),
+  observedAt: Schema.String,
+});
 
 export const goalGuardedActionTypes = [
   ...goalMutationTypes,
@@ -53,6 +101,10 @@ export const GoalDtoSchema = Schema.Struct({
   pauseReason: Schema.NullOr(Schema.String),
   usageLimitKind: Schema.NullOr(Schema.Literals(goalUsageLimitKinds)),
   usageResetAt: Schema.NullOr(Schema.String),
+  noProgressConsecutiveCount: Schema.Int,
+  noProgressLastContinuationId: Schema.NullOr(Schema.String),
+  noProgressAssistantResultFingerprint: Schema.NullOr(Schema.String),
+  noProgressEvidence: Schema.NullOr(GoalNoProgressEvidenceSchema),
 });
 
 export interface GoalDto {
@@ -73,6 +125,10 @@ export interface GoalDto {
   readonly pauseReason: string | null;
   readonly usageLimitKind: GoalUsageLimitKind | null;
   readonly usageResetAt: string | null;
+  readonly noProgressConsecutiveCount: number;
+  readonly noProgressLastContinuationId: string | null;
+  readonly noProgressAssistantResultFingerprint: string | null;
+  readonly noProgressEvidence: GoalNoProgressEvidence | null;
 }
 
 export interface GoalHistoryPage {

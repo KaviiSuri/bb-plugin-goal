@@ -8,6 +8,9 @@ import { it as effectIt } from "@effect/vitest";
 import { migrateGoalDatabase } from "./repository";
 import type { GoalThreadSnapshot } from "./coordinator";
 import { makeGoalRuntime, type GoalRuntime } from "./runtime";
+import type { GoalSettledContinuationObservation } from "./progress";
+import { fingerprintAssistantResult } from "./progress";
+import type { GoalProgressSignalKind } from "./domain";
 
 const idleThreadSnapshot = {
   status: "idle",
@@ -30,6 +33,10 @@ function makeFixture(
   options: {
     readonly readThread?: () => Promise<GoalThreadSnapshot>;
     readonly nowIso?: () => string;
+    readonly observeContinuation?: (
+      marker: string,
+    ) => Promise<GoalSettledContinuationObservation | null>;
+    readonly onSend?: (marker: string) => void;
   } = {},
 ): Fixture {
   const directory = mkdtempSync(join(tmpdir(), "bb-goal-"));
@@ -42,9 +49,14 @@ function makeFixture(
     {
       threadExists: async (threadId) => existingThreads.includes(threadId),
       readThread: options.readThread ?? (async () => idleThreadSnapshot),
-      sendContinuation: async () => {
+      sendContinuation: async (_threadId, marker) => {
         continuationSends += 1;
+        options.onSend?.(marker);
       },
+      observeContinuation:
+        options.observeContinuation === undefined
+          ? undefined
+          : async (_threadId, marker) => options.observeContinuation!(marker),
     },
     {
       nextGoalId: () => `goal_${++id}`,
@@ -61,6 +73,29 @@ function makeFixture(
       if (database.open) database.close();
       rmSync(directory, { recursive: true, force: true });
     },
+  };
+}
+
+function settledObservation(
+  sequence: number,
+  assistantText: string | null,
+  signals: readonly Exclude<
+    GoalProgressSignalKind,
+    "changed-assistant-result"
+  >[] = [],
+): GoalSettledContinuationObservation {
+  return {
+    requestEventId: `request_event_${sequence}`,
+    requestSeq: sequence * 10,
+    requestId: `request_${sequence}`,
+    acceptedEventId: `accepted_event_${sequence}`,
+    acceptedSeq: sequence * 10 + 1,
+    turnId: `turn_${sequence}`,
+    terminalEventId: `terminal_event_${sequence}`,
+    terminalSeq: sequence * 10 + 9,
+    signals,
+    assistantResultFingerprint:
+      assistantText === null ? null : fingerprintAssistantResult(assistantText),
   };
 }
 
@@ -1882,6 +1917,276 @@ describe("Goal coordinator", () => {
       expect(await fixture.runtime.recoverUsageLimits()).toEqual([]);
     } finally {
       await fixture.close();
+    }
+  });
+
+  it("pauses exactly on the third settled no-progress Continuation and prevents a fourth", async () => {
+    const observations = new Map<string, GoalSettledContinuationObservation>();
+    const markers: string[] = [];
+    const fixture = makeFixture(["thr_one"], {
+      onSend: (marker) => markers.push(marker),
+      observeContinuation: async (marker) => observations.get(marker) ?? null,
+    });
+    let sequence = 0;
+    const sendAndAssess = async (assistantText: string) => {
+      sequence += 1;
+      await fixture.runtime.enqueueIdle("thr_one", `idle-progress-${sequence}`);
+      await fixture.runtime.processContinuation(new AbortController().signal);
+      const marker = markers.at(-1)!;
+      observations.set(marker, settledObservation(sequence, assistantText));
+      await fixture.runtime.assessSettledContinuations();
+      const status = await fixture.runtime.run({ type: "status", threadId: "thr_one" });
+      if (!status.ok || !("goal" in status) || status.goal === null) {
+        throw new Error("Goal status was unavailable");
+      }
+      return status.goal;
+    };
+    try {
+      await fixture.runtime.run({
+        type: "start",
+        threadId: "thr_one",
+        objective: "stop a repeated automatic loop",
+      });
+      expect(await sendAndAssess("same result")).toMatchObject({
+        state: "active",
+        noProgressConsecutiveCount: 0,
+        noProgressEvidence: {
+          assessment: "progress",
+          signals: ["changed-assistant-result"],
+        },
+      });
+      expect(await sendAndAssess("same result")).toMatchObject({
+        state: "active",
+        noProgressConsecutiveCount: 1,
+      });
+      await Promise.all([
+        fixture.runtime.assessSettledContinuations(),
+        fixture.runtime.assessSettledContinuations(),
+      ]);
+      await expect(
+        fixture.runtime.run({ type: "status", threadId: "thr_one" }),
+      ).resolves.toMatchObject({
+        ok: true,
+        goal: { noProgressConsecutiveCount: 1 },
+      });
+      expect(await sendAndAssess("same\n result")).toMatchObject({
+        state: "active",
+        noProgressConsecutiveCount: 2,
+      });
+      const paused = await sendAndAssess("same result");
+      expect(paused).toMatchObject({
+        state: "paused",
+        revision: 2,
+        pauseReasonCode: "no-progress",
+        noProgressConsecutiveCount: 3,
+        noProgressEvidence: {
+          assessment: "no-progress",
+          signals: [],
+          turnId: "turn_4",
+        },
+      });
+      await fixture.runtime.assessSettledContinuations();
+      await fixture.runtime.enqueueIdle("thr_one", "idle-fourth-blocked");
+      expect(
+        await fixture.runtime.processContinuation(new AbortController().signal),
+      ).toBe(false);
+      expect(fixture.continuationSends()).toBe(4);
+
+      const resumed = await fixture.runtime.run({
+        type: "resume",
+        threadId: "thr_one",
+        goalId: "goal_1",
+        expectedRevision: 2,
+      });
+      expect(resumed).toMatchObject({
+        ok: true,
+        goal: {
+          state: "active",
+          revision: 3,
+          noProgressConsecutiveCount: 0,
+          noProgressLastContinuationId: null,
+          noProgressEvidence: null,
+        },
+      });
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it.each([
+    ["tool-call"],
+    ["file-mutation"],
+    ["external-action"],
+    ["pending-interaction"],
+  ] as const)("resets a persisted streak for %s progress", async (signal) => {
+    const observations = new Map<string, GoalSettledContinuationObservation>();
+    const markers: string[] = [];
+    const fixture = makeFixture(["thr_one"], {
+      onSend: (marker) => markers.push(marker),
+      observeContinuation: async (marker) => observations.get(marker) ?? null,
+    });
+    const send = async (
+      sequence: number,
+      assistantText: string,
+      signals: readonly Exclude<
+        GoalProgressSignalKind,
+        "changed-assistant-result"
+      >[] = [],
+    ) => {
+      await fixture.runtime.enqueueIdle("thr_one", `idle-${sequence}`);
+      await fixture.runtime.processContinuation(new AbortController().signal);
+      observations.set(
+        markers.at(-1)!,
+        settledObservation(sequence, assistantText, signals),
+      );
+      await fixture.runtime.assessSettledContinuations();
+    };
+    try {
+      await fixture.runtime.run({
+        type: "start",
+        threadId: "thr_one",
+        objective: "recognize structured work",
+      });
+      await send(1, "same result");
+      await send(2, "same result");
+      await send(3, "same result", [signal]);
+      await expect(
+        fixture.runtime.run({ type: "status", threadId: "thr_one" }),
+      ).resolves.toMatchObject({
+        ok: true,
+        goal: {
+          state: "active",
+          noProgressConsecutiveCount: 0,
+          noProgressEvidence: { assessment: "progress", signals: [signal] },
+        },
+      });
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("resets a streak when the normalized assistant result changes", async () => {
+    const observations = new Map<string, GoalSettledContinuationObservation>();
+    const markers: string[] = [];
+    const fixture = makeFixture(["thr_one"], {
+      onSend: (marker) => markers.push(marker),
+      observeContinuation: async (marker) => observations.get(marker) ?? null,
+    });
+    const send = async (sequence: number, assistantText: string) => {
+      await fixture.runtime.enqueueIdle("thr_one", `changed-${sequence}`);
+      await fixture.runtime.processContinuation(new AbortController().signal);
+      observations.set(
+        markers.at(-1)!,
+        settledObservation(sequence, assistantText),
+      );
+      await fixture.runtime.assessSettledContinuations();
+    };
+    try {
+      await fixture.runtime.run({
+        type: "start",
+        threadId: "thr_one",
+        objective: "compare assistant results",
+      });
+      await send(1, "first result");
+      await send(2, " first\nresult ");
+      await send(3, "a changed result");
+      await expect(
+        fixture.runtime.run({ type: "status", threadId: "thr_one" }),
+      ).resolves.toMatchObject({
+        ok: true,
+        goal: {
+          state: "active",
+          noProgressConsecutiveCount: 0,
+          noProgressEvidence: {
+            assessment: "progress",
+            signals: ["changed-assistant-result"],
+          },
+        },
+      });
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("recovers an unassessed settled Continuation and ignores it after an edit", async () => {
+    const observations = new Map<string, GoalSettledContinuationObservation>();
+    const markers: string[] = [];
+    const fixture = makeFixture(["thr_one"], {
+      onSend: (marker) => markers.push(marker),
+      observeContinuation: async (marker) => observations.get(marker) ?? null,
+    });
+    try {
+      await fixture.runtime.run({
+        type: "start",
+        threadId: "thr_one",
+        objective: "recover assessments",
+      });
+      await fixture.runtime.enqueueIdle("thr_one", "baseline");
+      await fixture.runtime.processContinuation(new AbortController().signal);
+      observations.set(markers.at(-1)!, settledObservation(1, "same"));
+      await fixture.runtime.assessSettledContinuations();
+
+      await fixture.runtime.enqueueIdle("thr_one", "settled-before-restart");
+      await fixture.runtime.processContinuation(new AbortController().signal);
+      observations.set(markers.at(-1)!, settledObservation(2, "same"));
+      await fixture.runtime.dispose();
+      const reloaded = makeGoalRuntime(
+        fixture.database,
+        {
+          threadExists: async () => true,
+          readThread: async () => idleThreadSnapshot,
+          sendContinuation: async () => {},
+          observeContinuation: async (_threadId, marker) =>
+            observations.get(marker) ?? null,
+        },
+        { nowIso: () => "2026-08-22T12:01:00.000Z" },
+      );
+      try {
+        await reloaded.recoverContinuations();
+        await reloaded.assessSettledContinuations();
+        await expect(
+          reloaded.run({ type: "status", threadId: "thr_one" }),
+        ).resolves.toMatchObject({
+          ok: true,
+          goal: { noProgressConsecutiveCount: 1 },
+        });
+
+        await reloaded.enqueueIdle("thr_one", "settled-before-edit");
+        await reloaded.processContinuation(new AbortController().signal);
+        const continuation = fixture.database
+          .prepare<{ opportunity: string }, { id: string; deliveryMarker: string }>(
+            "SELECT id, delivery_marker AS deliveryMarker FROM goal_continuations WHERE opportunity_key = @opportunity",
+          )
+          .get({ opportunity: "settled-before-edit" })!;
+        observations.set(
+          continuation.deliveryMarker,
+          settledObservation(3, "same"),
+        );
+        await reloaded.run({
+          type: "edit",
+          threadId: "thr_one",
+          goalId: "goal_1",
+          expectedRevision: 1,
+          objective: "edited objective",
+        });
+        await reloaded.assessSettledContinuations();
+        await expect(
+          reloaded.run({ type: "status", threadId: "thr_one" }),
+        ).resolves.toMatchObject({
+          ok: true,
+          goal: {
+            state: "active",
+            revision: 2,
+            noProgressConsecutiveCount: 0,
+            noProgressEvidence: null,
+          },
+        });
+      } finally {
+        await reloaded.dispose();
+      }
+    } finally {
+      if (fixture.database.open) fixture.database.close();
+      rmSync(fixture.directory, { recursive: true, force: true });
     }
   });
 

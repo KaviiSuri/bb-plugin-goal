@@ -28,6 +28,10 @@ const activeGoal = {
   pauseReason: null,
   usageLimitKind: null,
   usageResetAt: null,
+  noProgressConsecutiveCount: 0,
+  noProgressLastContinuationId: null,
+  noProgressAssistantResultFingerprint: null,
+  noProgressEvidence: null,
 };
 
 type RpcHandlers = PluginRpcTestHandlers<typeof rpcContract>;
@@ -417,6 +421,50 @@ describe("Goal composer row", () => {
       expect(
         slot.getByText(/Usage limit: credits \(manual resume required\)/),
       ).toBeTruthy();
+    } finally {
+      slot.lifecycle.unmount();
+    }
+  });
+
+  it("shows the bounded no-progress count and structured evidence in history", async () => {
+    const paused: Goal = {
+      ...activeGoal,
+      state: "paused",
+      revision: 2,
+      pauseReasonCode: "no-progress",
+      pauseReason:
+        "Paused after 3 consecutive automatic Continuations made no observable progress",
+      noProgressConsecutiveCount: 3,
+      noProgressLastContinuationId: "continuation_3",
+      noProgressAssistantResultFingerprint: "abc123",
+      noProgressEvidence: {
+        continuationId: "continuation_3",
+        requestEventId: "request_event_3",
+        requestSeq: 30,
+        requestId: "request_3",
+        acceptedEventId: "accepted_event_3",
+        acceptedSeq: 31,
+        turnId: "turn_3",
+        terminalEventId: "terminal_event_3",
+        terminalSeq: 39,
+        signals: [],
+        assistantResultFingerprint: "abc123",
+        previousAssistantResultFingerprint: "abc123",
+        assessment: "no-progress",
+        observedAt: "2026-08-22T12:05:00.000Z",
+      },
+    };
+    const slot = renderSlot<
+      { threadId: string; params: JsonValue | null },
+      typeof rpcContract
+    >(historyPanel(), { threadId: "thr_ui", params: null }, {
+      rpc: handlers(paused),
+    });
+    try {
+      expect(await slot.findByText("Paused Goal")).toBeTruthy();
+      expect(slot.getByText(/No-progress count: 3/)).toBeTruthy();
+      expect(slot.getByText(/turn turn_3/)).toBeTruthy();
+      expect(slot.getByText(/no qualifying signals/)).toBeTruthy();
     } finally {
       slot.lifecycle.unmount();
     }
