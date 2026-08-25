@@ -194,7 +194,9 @@ function formatGoal(goal: GoalDto, heading: string): string {
       ? []
       : [`Usage limit: ${goal.usageLimitKind}`]),
     ...(goal.usageResetAt === null
-      ? []
+      ? goal.pauseReasonCode === "usage-limit"
+        ? ["Manual resume required: yes"]
+        : []
       : [`Usage reset at: ${goal.usageResetAt}`]),
   ].join("\n");
 }
