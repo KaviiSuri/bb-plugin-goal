@@ -515,8 +515,8 @@ function goalAgentInstructions(goal: GoalDto): string {
     `Goal revision: ${goal.revision}`,
     "Keep working until the full objective is complete. Do not stop after only a plan or partial progress.",
     "Only the user may edit, pause, resume, cancel, or delete this Goal.",
-    "Call goal_complete only after every requirement is satisfied and verified. Pass the exact Goal ID and revision shown here, a concrete completion summary, and verification evidence.",
-    "Call goal_blocked only for a genuine external impasse that requires a user or external action. Do not use it for ordinary difficulty, uncertainty, provider failures, usage limits, pending interactions, or a blocker that changed. The same external blocker must persist for at least three consecutive Goal turns. Pass the exact Goal ID and revision, the required external action, concrete evidence, and the repeated-turn count.",
+    "Call bb_goal_complete only after every requirement is satisfied and verified. Pass the exact Goal ID and revision shown here, a concrete completion summary, and verification evidence.",
+    "Call bb_goal_blocked only for a genuine external impasse that requires a user or external action. Do not use it for ordinary difficulty, uncertainty, provider failures, usage limits, pending interactions, or a blocker that changed. The same external blocker must persist for at least three consecutive Goal turns. Pass the exact Goal ID and revision, the required external action, concrete evidence, and the repeated-turn count.",
     "A stale Goal ID or revision cannot complete or block an edited, terminal, or replacement Goal.",
     "Objective:",
   ].join("\n");
@@ -1520,7 +1520,7 @@ export function createPlugin(
     const snapshots = makeCurrentGoalSnapshotReader(database);
 
     bb.agents.registerTool({
-      name: "goal_complete",
+      name: "bb_goal_complete",
       description:
         "Mark the active BB Goal completed after all required work is done and verified.",
       instructions:
@@ -1552,7 +1552,7 @@ export function createPlugin(
     });
 
     bb.agents.registerTool({
-      name: "goal_blocked",
+      name: "bb_goal_blocked",
       description:
         "Report a genuine external Blockage after the same blocker persists for at least three consecutive Goal turns.",
       instructions:
@@ -1601,11 +1601,11 @@ export function createPlugin(
       return {
         tools: [
           {
-            name: "goal_complete",
+            name: "bb_goal_complete",
             parameters: goalCompleteParameters(goal),
           },
           {
-            name: "goal_blocked",
+            name: "bb_goal_blocked",
             parameters: goalBlockedParameters(goal),
           },
         ],

@@ -116,8 +116,8 @@ describe("Goal BB adapter", () => {
         "delete",
       ]);
       expect(harness.inspection.registrations.agentTools).toMatchObject([
-        { name: "goal_complete" },
-        { name: "goal_blocked" },
+        { name: "bb_goal_complete" },
+        { name: "bb_goal_blocked" },
       ]);
       expect(
         harness.inspection.registrations.agentConfigurationProvider,
@@ -1653,12 +1653,12 @@ describe("Goal BB adapter", () => {
           "Only the user may edit, pause, resume, cancel, or delete this Goal.",
         );
         expect(configuration.instructions).toContain(
-          "Call goal_complete only after every requirement is satisfied and verified.",
+          "Call bb_goal_complete only after every requirement is satisfied and verified.",
         );
         expect(configuration.instructions!.length).toBeLessThanOrEqual(4096);
         expect(configuration.tools).toHaveLength(2);
         expect(configuration.tools[0]).toMatchObject({
-          name: "goal_complete",
+          name: "bb_goal_complete",
           inputSchema: {
             type: "object",
             additionalProperties: false,
@@ -1669,7 +1669,7 @@ describe("Goal BB adapter", () => {
           },
         });
         expect(configuration.tools[1]).toMatchObject({
-          name: "goal_blocked",
+          name: "bb_goal_blocked",
           inputSchema: {
             properties: {
               goalId: { const: "goal_agent" },
@@ -1726,7 +1726,7 @@ describe("Goal BB adapter", () => {
       expect(configuration.instructions).toContain("Pause before continuing");
       expect(configuration.tools).toMatchObject([
         {
-          name: "goal_complete",
+          name: "bb_goal_complete",
           inputSchema: {
             properties: {
               goalId: { const: resumed.goal.id },
@@ -1735,7 +1735,7 @@ describe("Goal BB adapter", () => {
           },
         },
         {
-          name: "goal_blocked",
+          name: "bb_goal_blocked",
           inputSchema: {
             properties: {
               goalId: { const: resumed.goal.id },
@@ -1760,7 +1760,7 @@ describe("Goal BB adapter", () => {
 
       await expect(
         harness.behavior.callAgentTool(
-          "goal_complete",
+          "bb_goal_complete",
           {
             goalId: started.goal.id,
             expectedRevision: 1,
@@ -1771,7 +1771,7 @@ describe("Goal BB adapter", () => {
       ).rejects.toThrow(/verificationEvidence/);
       await expect(
         harness.behavior.callAgentTool(
-          "goal_complete",
+          "bb_goal_complete",
           {
             goalId: "goal_wrong",
             expectedRevision: 1,
@@ -1790,7 +1790,7 @@ describe("Goal BB adapter", () => {
       })) as { goal: GoalDto };
       await expect(
         harness.behavior.callAgentTool(
-          "goal_complete",
+          "bb_goal_complete",
           {
             goalId: started.goal.id,
             expectedRevision: 1,
@@ -1802,7 +1802,7 @@ describe("Goal BB adapter", () => {
       ).rejects.toThrow("[stale_goal]");
 
       const toolResult = await harness.behavior.callAgentTool(
-        "goal_complete",
+        "bb_goal_complete",
         {
           goalId: edited.goal.id,
           expectedRevision: edited.goal.revision,
@@ -1868,7 +1868,7 @@ describe("Goal BB adapter", () => {
 
       await expect(
         harness.behavior.callAgentTool(
-          "goal_complete",
+          "bb_goal_complete",
           {
             goalId: edited.goal.id,
             expectedRevision: 3,
@@ -1885,7 +1885,7 @@ describe("Goal BB adapter", () => {
       })) as { goal: GoalDto };
       await expect(
         harness.behavior.callAgentTool(
-          "goal_complete",
+          "bb_goal_complete",
           {
             goalId: edited.goal.id,
             expectedRevision: 3,
@@ -1926,7 +1926,7 @@ describe("Goal BB adapter", () => {
 
       await expect(
         initial.harness.behavior.callAgentTool(
-          "goal_blocked",
+          "bb_goal_blocked",
           {
             goalId: "goal_wrong",
             expectedRevision: 1,
@@ -1939,7 +1939,7 @@ describe("Goal BB adapter", () => {
       ).rejects.toThrow("[goal_not_found]");
       await expect(
         initial.harness.behavior.callAgentTool(
-          "goal_blocked",
+          "bb_goal_blocked",
           {
             goalId: started.goal.id,
             expectedRevision: 1,
@@ -1952,7 +1952,7 @@ describe("Goal BB adapter", () => {
       ).rejects.toThrow(/repeatedTurns/);
 
       const first = await initial.harness.behavior.callAgentTool(
-        "goal_blocked",
+        "bb_goal_blocked",
         {
           goalId: started.goal.id,
           expectedRevision: 1,
@@ -1994,7 +1994,7 @@ describe("Goal BB adapter", () => {
       const reloaded = await initial.harness.lifecycle.reload(observedPlugin);
       try {
         const second = await reloaded.harness.behavior.callAgentTool(
-          "goal_blocked",
+          "bb_goal_blocked",
           {
             goalId: started.goal.id,
             expectedRevision: 1,
@@ -2014,7 +2014,7 @@ describe("Goal BB adapter", () => {
 
         await expect(
           reloaded.harness.behavior.callAgentTool(
-            "goal_blocked",
+            "bb_goal_blocked",
             {
               goalId: started.goal.id,
               expectedRevision: 1,
@@ -2027,7 +2027,7 @@ describe("Goal BB adapter", () => {
         ).rejects.toThrow(/same external blocker/);
         await expect(
           reloaded.harness.behavior.callAgentTool(
-            "goal_blocked",
+            "bb_goal_blocked",
             {
               goalId: started.goal.id,
               expectedRevision: 1,
@@ -2040,7 +2040,7 @@ describe("Goal BB adapter", () => {
         ).rejects.toThrow(/expected report 3/);
 
         const toolResult = await reloaded.harness.behavior.callAgentTool(
-          "goal_blocked",
+          "bb_goal_blocked",
           {
             goalId: started.goal.id,
             expectedRevision: 1,
