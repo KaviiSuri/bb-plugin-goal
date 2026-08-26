@@ -1,0 +1,116 @@
+name: Release
+
+# On demand only: trigger from Actions or `gh workflow run release.yml`.
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version bump
+        type: choice
+        required: true
+        default: patch
+        options: [patch, minor, major, custom]
+      custom_version:
+        description: Exact version when bump is custom (for example, 1.4.2)
+        type: string
+        required: false
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check plugin
+        run: npm run check
+
+      - name: Configure Git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Bump version
+        id: version
+        env:
+          BUMP: ${{ inputs.bump }}
+          CUSTOM_VERSION: ${{ inputs.custom_version }}
+        run: |
+          set -euo pipefail
+          if [[ "$BUMP" == "custom" ]]; then
+            if [[ -z "$CUSTOM_VERSION" ]]; then
+              echo "custom_version is required when bump is custom" >&2
+              exit 1
+            fi
+            spec="$CUSTOM_VERSION"
+          else
+            spec="$BUMP"
+          fi
+          version=$(npm version "$spec" --no-git-tag-version)
+          version="${version#v}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+      - name: Reject an existing tag
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          if git rev-parse --verify --quiet "refs/tags/$TAG" >/dev/null; then
+            echo "tag $TAG already exists" >&2
+            exit 1
+          fi
+
+      - name: Build versioned plugin artifacts
+        run: npm run build
+
+      - name: Commit and tag
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git add package.json package-lock.json
+          git add --force dist/
+          git commit -m "release: $TAG"
+          git tag --annotate "$TAG" --message "$TAG"
+
+      - name: Publish commit and tag atomically
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: git push --atomic origin HEAD:main "refs/tags/$TAG"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: gh release create "$TAG" --verify-tag --generate-notes --title "$TAG"
+
+      - name: Summary
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          {
+            echo "### Released $TAG"
+            echo
+            echo '```sh'
+            echo "bb plugin install git:https://github.com/KaviiSuri/bb-plugin-goal.git@$TAG"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
