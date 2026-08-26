@@ -537,17 +537,17 @@ export function GoalComposerRow() {
   return (
     <section
       aria-label="Goal"
-      className="border-t border-border/70 px-3 py-2 text-sm"
+      className="min-w-0 overflow-hidden text-xs"
     >
       {view.kind === "loading" ? (
-        <div className="flex min-h-8 items-center gap-2 text-muted-foreground">
+        <div className="flex min-h-8 items-center gap-2 px-3 text-muted-foreground">
           <span className="size-1.5 rounded-full bg-muted-foreground/60" />
           Loading Goal
         </div>
       ) : null}
 
       {view.kind === "empty" && !starting ? (
-        <div className="flex min-h-8 items-center justify-between gap-3">
+        <div className="flex min-h-8 items-center justify-between gap-3 px-3">
           <div className="min-w-0">
             <span className="font-medium text-foreground">Goal</span>
             <span className="ml-2 text-muted-foreground">
@@ -570,7 +570,7 @@ export function GoalComposerRow() {
       ) : null}
 
       {view.kind === "empty" && starting ? (
-        <form className="flex items-center gap-2" onSubmit={startGoal}>
+        <form className="flex items-center gap-2 p-2" onSubmit={startGoal}>
           <label className="sr-only" htmlFor="goal-objective">
             Goal objective
           </label>
@@ -606,7 +606,7 @@ export function GoalComposerRow() {
       ) : null}
 
       {view.kind === "current" && editing ? (
-        <form className="flex items-center gap-2" onSubmit={editGoal}>
+        <form className="flex items-center gap-2 p-2" onSubmit={editGoal}>
           <label className="sr-only" htmlFor="goal-objective-edit">
             Edit Goal objective
           </label>
@@ -641,7 +641,7 @@ export function GoalComposerRow() {
       ) : null}
 
       {view.kind === "current" && !editing ? (
-        <div className="flex min-h-8 items-center gap-3">
+        <div className="flex min-h-8 min-w-0 items-center gap-3 px-3">
           <span className="inline-flex shrink-0 items-center gap-1.5 font-medium text-foreground">
             <span
               className={`size-2 rounded-full ${
@@ -718,7 +718,7 @@ export function GoalComposerRow() {
       ) : null}
 
       {actionError !== null ? (
-        <div className="mt-1 flex items-center justify-between gap-3 text-destructive">
+        <div className="flex items-center justify-between gap-3 border-t border-border/35 px-3 py-1 text-destructive">
           <span className="truncate">{actionError}</span>
           <Button size="sm" variant="ghost" onClick={() => void load()}>
             Refresh
@@ -727,7 +727,7 @@ export function GoalComposerRow() {
       ) : null}
 
       {view.kind === "error" ? (
-        <div className="flex min-h-8 items-center justify-between gap-3 text-destructive">
+        <div className="flex min-h-8 items-center justify-between gap-3 px-3 text-destructive">
           <span className="truncate">{view.message}</span>
           <Button size="sm" variant="ghost" onClick={() => void load()}>
             Retry
@@ -752,7 +752,7 @@ export default definePluginApp((app) => {
     banners: [
       {
         id: "current-goal",
-        chrome: "bare",
+        chrome: "card",
         component: GoalComposerRow,
       },
     ],

@@ -127,7 +127,7 @@ describe("Goal composer row", () => {
     expect(app.composerCustomizations[0]).toMatchObject({
       id: "goal-row",
       scopes: ["thread"],
-      banners: [{ id: "current-goal", chrome: "bare" }],
+      banners: [{ id: "current-goal", chrome: "card" }],
     });
 
     const slot = renderSlot<{}, typeof rpcContract>(
@@ -626,8 +626,12 @@ describe("Goal composer row", () => {
     );
     try {
       expect(await slot.findByText("Active Goal")).toBeTruthy();
+      const banner = slot.getByRole("region", { name: "Goal" });
+      expect(banner.className).toContain("min-w-0");
+      expect(banner.className).toContain("overflow-hidden");
       const objective = slot.getByTitle(longObjective);
       expect(objective.textContent).toBe(longObjective);
+      expect(objective.parentElement?.className).toContain("min-w-0");
       expect(slot.queryByRole("button", { name: "Start Goal" })).toBeNull();
     } finally {
       slot.lifecycle.unmount();
