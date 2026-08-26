@@ -140,7 +140,12 @@ describe("Goal composer row", () => {
       },
     );
     try {
-      fireEvent.click(await slot.findByRole("button", { name: "Start Goal" }));
+      const startGoal = await slot.findByRole("button", { name: "Start Goal" });
+      const history = slot.getByRole("button", { name: "History" });
+      expect(startGoal.className).toContain("h-7");
+      expect(startGoal.className).not.toContain("border");
+      expect(history.className).toContain("h-7");
+      fireEvent.click(startGoal);
       const input = slot.getByRole("textbox", { name: "Goal objective" });
       fireEvent.change(input, { target: { value: "Ship the complete path" } });
       fireEvent.click(slot.getByRole("button", { name: "Start" }));

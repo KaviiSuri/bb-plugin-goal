@@ -533,6 +533,7 @@ export function GoalComposerRow() {
   }
 
   const busy = pending !== null;
+  const actionClass = "h-7 rounded-md px-2 text-xs";
 
   return (
     <section
@@ -555,12 +556,18 @@ export function GoalComposerRow() {
             </span>
           </div>
           <div className="flex shrink-0 items-center gap-1">
-            <Button size="sm" variant="ghost" onClick={openHistory}>
+            <Button
+              size="sm"
+              variant="ghost"
+              className={actionClass}
+              onClick={openHistory}
+            >
               History
             </Button>
             <Button
               size="sm"
-              variant="outline"
+              variant="secondary"
+              className={actionClass}
               onClick={() => setStarting(true)}
             >
               Start Goal
@@ -585,6 +592,7 @@ export function GoalComposerRow() {
           <Button
             size="sm"
             type="submit"
+            className={actionClass}
             disabled={busy || objective.trim().length === 0}
           >
             {pending === "start" ? "Starting" : "Start"}
@@ -593,6 +601,7 @@ export function GoalComposerRow() {
             size="sm"
             type="button"
             variant="ghost"
+            className={actionClass}
             disabled={busy}
             onClick={() => {
               setStarting(false);
@@ -620,6 +629,7 @@ export function GoalComposerRow() {
           <Button
             size="sm"
             type="submit"
+            className={actionClass}
             disabled={busy || objective.trim().length === 0}
           >
             {pending === "edit" ? "Saving" : "Save"}
@@ -628,6 +638,7 @@ export function GoalComposerRow() {
             size="sm"
             type="button"
             variant="ghost"
+            className={actionClass}
             disabled={busy}
             onClick={() => {
               setEditing(false);
@@ -683,6 +694,7 @@ export function GoalComposerRow() {
               <Button
                 size="sm"
                 variant="ghost"
+                className={actionClass}
                 disabled={busy}
                 onClick={openHistory}
               >
@@ -692,6 +704,7 @@ export function GoalComposerRow() {
                 <Button
                   size="sm"
                   variant="ghost"
+                  className={actionClass}
                   aria-label="Edit Goal"
                   disabled={busy}
                   onClick={() => {
@@ -706,6 +719,7 @@ export function GoalComposerRow() {
                   <Button
                     size="sm"
                     variant="ghost"
+                    className={actionClass}
                     aria-label="Pause Goal"
                     disabled={busy}
                     onClick={() => void mutateGoal("pause")}
@@ -717,6 +731,7 @@ export function GoalComposerRow() {
                   <Button
                     size="sm"
                     variant="ghost"
+                    className={actionClass}
                     aria-label="Resume Goal"
                     disabled={busy}
                     onClick={() => void mutateGoal("resume")}
@@ -727,6 +742,7 @@ export function GoalComposerRow() {
                 <Button
                   size="sm"
                   variant="ghost"
+                  className={actionClass}
                   aria-label="Cancel Goal"
                   disabled={busy}
                   onClick={() => void mutateGoal("cancel")}
@@ -751,7 +767,12 @@ export function GoalComposerRow() {
       {view.kind === "error" ? (
         <div className="flex min-h-8 items-center justify-between gap-3 px-3 text-destructive">
           <span className="truncate">{view.message}</span>
-          <Button size="sm" variant="ghost" onClick={() => void load()}>
+          <Button
+            size="sm"
+            variant="ghost"
+            className={actionClass}
+            onClick={() => void load()}
+          >
             Retry
           </Button>
         </div>
