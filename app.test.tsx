@@ -127,7 +127,7 @@ describe("Goal composer row", () => {
     expect(app.composerCustomizations[0]).toMatchObject({
       id: "goal-row",
       scopes: ["thread"],
-      banners: [{ id: "current-goal", chrome: "card" }],
+      banners: [{ id: "current-goal", chrome: "bare" }],
     });
 
     const slot = renderSlot<{}, typeof rpcContract>(
@@ -146,7 +146,7 @@ describe("Goal composer row", () => {
       fireEvent.click(slot.getByRole("button", { name: "Start" }));
 
       expect(await slot.findByText("Active Goal")).toBeTruthy();
-      expect(slot.getByText("Ship the complete path")).toBeTruthy();
+      expect(slot.getByTitle("Ship the complete path")).toBeTruthy();
       fireEvent.click(slot.getByRole("button", { name: "History" }));
       expect(slot.inspection.navigateCalls).toEqual([
         {
@@ -192,7 +192,9 @@ describe("Goal composer row", () => {
       expect(editInput.getAttribute("value")).toBe(activeGoal.objective);
       fireEvent.change(editInput, { target: { value: "Redirected objective" } });
       fireEvent.click(slot.getByRole("button", { name: "Save" }));
-      expect(await slot.findByText("Redirected objective")).toBeTruthy();
+      await waitFor(() =>
+        expect(slot.getByTitle("Redirected objective")).toBeTruthy(),
+      );
 
       fireEvent.click(slot.getByRole("button", { name: "Pause Goal" }));
       expect(await slot.findByText("Paused Goal")).toBeTruthy();
@@ -627,11 +629,17 @@ describe("Goal composer row", () => {
     try {
       expect(await slot.findByText("Active Goal")).toBeTruthy();
       const banner = slot.getByRole("region", { name: "Goal" });
+      expect(banner.className).toContain("max-w-[760px]");
       expect(banner.className).toContain("min-w-0");
       expect(banner.className).toContain("overflow-hidden");
       const objective = slot.getByTitle(longObjective);
       expect(objective.textContent).toBe(longObjective);
       expect(objective.parentElement?.className).toContain("min-w-0");
+      const summary = slot.getByLabelText("Goal details");
+      const details = summary.parentElement as HTMLDetailsElement;
+      expect(details.open).toBe(false);
+      fireEvent.click(summary);
+      expect(details.open).toBe(true);
       expect(slot.queryByRole("button", { name: "Start Goal" })).toBeNull();
     } finally {
       slot.lifecycle.unmount();

@@ -537,7 +537,7 @@ export function GoalComposerRow() {
   return (
     <section
       aria-label="Goal"
-      className="min-w-0 overflow-hidden text-xs"
+      className="w-full max-w-[760px] min-w-0 overflow-hidden rounded-xl border border-border bg-card text-xs shadow-sm"
     >
       {view.kind === "loading" ? (
         <div className="flex min-h-8 items-center gap-2 px-3 text-muted-foreground">
@@ -641,80 +641,102 @@ export function GoalComposerRow() {
       ) : null}
 
       {view.kind === "current" && !editing ? (
-        <div className="flex min-h-8 min-w-0 items-center gap-3 px-3">
-          <span className="inline-flex shrink-0 items-center gap-1.5 font-medium text-foreground">
+        <details className="group">
+          <summary
+            className="flex min-h-8 min-w-0 cursor-pointer list-none items-center gap-2 px-3 [&::-webkit-details-marker]:hidden"
+            aria-label="Goal details"
+          >
             <span
-              className={`size-2 rounded-full ${
+              className={`size-2 shrink-0 rounded-full ${
                 view.goal.state === "active"
                   ? "bg-success"
                   : "bg-muted-foreground"
               }`}
             />
-            {goalStateLabel(view.goal.state)}
-          </span>
-          <span
-            className="min-w-0 flex-1 truncate text-muted-foreground"
-            title={view.goal.pauseReason ?? view.goal.objective}
-          >
-            {view.goal.objective}
-            {view.goal.pauseReason === null ? "" : ` · ${view.goal.pauseReason}`}
-          </span>
-          {view.goal.noProgressConsecutiveCount > 0 ? (
-            <span className="shrink-0 text-xs text-muted-foreground">
-              No-progress {view.goal.noProgressConsecutiveCount}/3
+            <span className="shrink-0 font-medium text-foreground">
+              {goalStateLabel(view.goal.state)}
             </span>
-          ) : null}
-          <div className="flex shrink-0 items-center gap-1">
-            <Button
-              size="sm"
-              variant="ghost"
-              disabled={busy}
-              onClick={openHistory}
+            <span
+              className="min-w-0 flex-1 truncate text-muted-foreground"
+              title={view.goal.pauseReason ?? view.goal.objective}
             >
-              History
-            </Button>
-            <Button
-              size="sm"
-              variant="ghost"
-              disabled={busy}
-              onClick={() => {
-                setObjective(view.goal.objective);
-                setEditing(true);
-                setActionError(null);
-              }}
+              {view.goal.objective}
+            </span>
+            <span
+              aria-hidden="true"
+              className="shrink-0 text-muted-foreground transition-transform group-open:rotate-180"
             >
-              Edit Goal
-            </Button>
-            {view.goal.state === "active" || view.goal.state === "waiting" ? (
+              ⌄
+            </span>
+          </summary>
+          <div className="border-t border-border/50 bg-muted/20">
+            <p className="whitespace-pre-wrap px-3 py-2.5 text-sm leading-relaxed text-foreground/90">
+              {view.goal.objective}
+              {view.goal.pauseReason === null ? "" : ` · ${view.goal.pauseReason}`}
+            </p>
+            {view.goal.noProgressConsecutiveCount > 0 ? (
+              <p className="px-3 pb-2 text-muted-foreground">
+                No-progress {view.goal.noProgressConsecutiveCount}/3
+              </p>
+            ) : null}
+            <div className="flex flex-wrap items-center justify-between gap-1 border-t border-border/35 px-2 py-1">
               <Button
                 size="sm"
                 variant="ghost"
                 disabled={busy}
-                onClick={() => void mutateGoal("pause")}
+                onClick={openHistory}
               >
-                {pending === "pause" ? "Pausing" : "Pause Goal"}
+                History
               </Button>
-            ) : null}
-            {view.goal.state === "paused" || view.goal.state === "waiting" ? (
-              <Button
-                size="sm"
-                variant="ghost"
-                disabled={busy}
-                onClick={() => void mutateGoal("resume")}
-              >
-                {pending === "resume" ? "Resuming" : "Resume Goal"}
-              </Button>
-            ) : null}
-            <Button
-              size="sm"
-              variant="ghost"
-              disabled={busy}
-              onClick={() => void mutateGoal("cancel")}
-            >
-              {pending === "cancel" ? "Canceling" : "Cancel Goal"}
-            </Button>
+              <div className="flex flex-wrap items-center justify-end gap-1">
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  aria-label="Edit Goal"
+                  disabled={busy}
+                  onClick={() => {
+                    setObjective(view.goal.objective);
+                    setEditing(true);
+                    setActionError(null);
+                  }}
+                >
+                  Edit
+                </Button>
+                {view.goal.state === "active" || view.goal.state === "waiting" ? (
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    aria-label="Pause Goal"
+                    disabled={busy}
+                    onClick={() => void mutateGoal("pause")}
+                  >
+                    {pending === "pause" ? "Pausing" : "Pause"}
+                  </Button>
+                ) : null}
+                {view.goal.state === "paused" || view.goal.state === "waiting" ? (
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    aria-label="Resume Goal"
+                    disabled={busy}
+                    onClick={() => void mutateGoal("resume")}
+                  >
+                    {pending === "resume" ? "Resuming" : "Resume"}
+                  </Button>
+                ) : null}
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  aria-label="Cancel Goal"
+                  disabled={busy}
+                  onClick={() => void mutateGoal("cancel")}
+                >
+                  {pending === "cancel" ? "Canceling" : "Cancel"}
+                </Button>
+              </div>
+            </div>
           </div>
-        </div>
+        </details>
       ) : null}
 
       {actionError !== null ? (
@@ -752,7 +774,7 @@ export default definePluginApp((app) => {
     banners: [
       {
         id: "current-goal",
-        chrome: "card",
+        chrome: "bare",
         component: GoalComposerRow,
       },
     ],
